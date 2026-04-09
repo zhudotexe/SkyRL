@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import ray
+import torch
 from ray import ObjectRef
 from ray.actor import ActorHandle
 
@@ -170,37 +171,46 @@ class MeshDispatch(Dispatch):
         cls,
         dp_size: int,
         data: TrainingInputBatch,
-        mini_batch_size: int,
+        mini_batch_boundaries: List[Tuple[int, int]],
     ) -> List[List[ObjectRef]]:
-        """
-        Pre-stage all mini-batch chunks into the object store.
+        """Pre-stage mini-batch chunks into the object store.
 
-        Slices the full batch into mini-batches, chunks each by DP rank, and
-        ``ray.put``s each chunk.
+        Each mini-batch is defined by a ``(start, end)`` index pair from
+        *mini_batch_boundaries*.  Mini-batches are individually padded so
+        that their size is divisible by *dp_size*, using dummy entries with
+        ``loss_mask=0`` that do not affect the loss.
 
         Args:
-            dp_size: Number of data-parallel ranks
-            data: Full TrainingInputBatch to slice from
-            mini_batch_size: Size of each mini-batch (before DP chunking)
+            dp_size: Number of data-parallel ranks.
+            data: Full TrainingInputBatch to slice from.
+            mini_batch_boundaries: List of ``(start, end)`` index pairs.
 
         Returns:
-            List of per-mini-batch chunk ref lists.  ``result[i][dp_rank]`` is
-            the ObjectRef for mini-batch *i*, DP rank *dp_rank*.
+            ``result[i][dp_rank]`` – ObjectRef for mini-batch *i*, DP rank *dp_rank*.
         """
-        assert (
-            len(data) % mini_batch_size == 0
-        ), f"data batch size must be divisible by mini_batch_size, got {len(data)} and {mini_batch_size}"
-        assert (
-            mini_batch_size % dp_size == 0
-        ), f"mini_batch_size must be divisible by dp_size, got {mini_batch_size} and {dp_size}"
-        num_mini_batches = len(data) // mini_batch_size
-        chunk_size = mini_batch_size // dp_size
-
         all_chunk_refs: List[List[ObjectRef]] = []
-        for step in range(num_mini_batches):
-            start = step * mini_batch_size
-            end = start + mini_batch_size
+        for start, end in mini_batch_boundaries:
             mini_batch = data[start:end]
+            mb_size = end - start
+
+            # Pad to make divisible by dp_size
+            pad_size = (-mb_size) % dp_size
+            if pad_size > 0:
+                new_tensors = {}
+                for key, tensor in mini_batch.items():
+                    if tensor is not None:
+                        additional_dims = tuple(tensor.shape[1:]) if len(tensor.shape) > 1 else ()
+                        if key == "is_last_step":
+                            padding = torch.ones(pad_size, *additional_dims, dtype=tensor.dtype, device=tensor.device)
+                        elif key == "loss_mask":
+                            padding = torch.zeros(pad_size, *additional_dims, dtype=tensor.dtype, device=tensor.device)
+                        else:
+                            padding = tensor[:pad_size].clone()
+                        new_tensors[key] = torch.cat([tensor, padding], dim=0)
+                mini_batch = TrainingInputBatch(new_tensors)
+                mini_batch.metadata = data.metadata
+
+            chunk_size = len(mini_batch) // dp_size
             chunks = mini_batch.chunk(chunk_size)
             all_chunk_refs.append([ray.put(chunk) for chunk in chunks])
         return all_chunk_refs

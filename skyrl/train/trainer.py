@@ -79,6 +79,46 @@ from skyrl.train.utils.trainer_utils import (
 from skyrl.train.utils.utils import ResolvedPlacementGroup, configure_ray_worker_logging
 
 
+def compute_prompt_end_indices(uids: List[str]) -> List[int]:
+    """Return the exclusive end-index of each prompt's contiguous block.
+
+    ``uids`` is a flat list where consecutive equal values belong to the same
+    prompt.  Works for both step-wise (variable sequences per prompt) and
+    non-step-wise (fixed ``n_samples_per_prompt`` sequences per prompt).
+    """
+    end_indices: List[int] = []
+    for i in range(1, len(uids)):
+        if uids[i] != uids[i - 1]:
+            end_indices.append(i)
+    end_indices.append(len(uids))
+    return end_indices
+
+
+def compute_prompt_mini_batch_boundaries(
+    prompt_end_indices: List[int],
+    mini_batch_size_in_prompts: int,
+) -> List[Tuple[int, int]]:
+    """Compute mini-batch boundaries from pre-computed prompt end-indices.
+
+    Each mini-batch spans exactly ``mini_batch_size_in_prompts`` prompts
+    (the last mini-batch may be smaller if the total prompt count is not
+    divisible).
+
+    Returns:
+        List of ``(start, end)`` index pairs suitable for slicing a
+        TrainingInputBatch.
+    """
+    num_prompts = len(prompt_end_indices)
+    boundaries: List[Tuple[int, int]] = []
+    start_seq = 0
+    for i in range(0, num_prompts, mini_batch_size_in_prompts):
+        end_prompt_idx = min(i + mini_batch_size_in_prompts, num_prompts) - 1
+        end_seq = prompt_end_indices[end_prompt_idx]
+        boundaries.append((start_seq, end_seq))
+        start_seq = end_seq
+    return boundaries
+
+
 class RayPPOTrainer:
     def __init__(
         self,
@@ -660,6 +700,15 @@ class RayPPOTrainer:
         training_input.metadata = {"uids": uids}
         # padded response length
         training_input.metadata["response_length"] = response_masks_tensor.shape[1]
+        # Mini-batch boundaries for training — precomputed from uid grouping.
+        prompt_end_indices = compute_prompt_end_indices(uids)
+        training_input.metadata["policy_mini_batch_boundaries"] = compute_prompt_mini_batch_boundaries(
+            prompt_end_indices, self.cfg.trainer.policy_mini_batch_size
+        )
+        if self.cfg.trainer.critic.model.path is not None:
+            training_input.metadata["critic_mini_batch_boundaries"] = compute_prompt_mini_batch_boundaries(
+                prompt_end_indices, self.cfg.trainer.critic_mini_batch_size
+            )
         batch_num_seq, batch_padded_seq_len = sequences_tensor.shape
         logger.info(f"batch_num_seq: {batch_num_seq}, batch_padded_seq_len: {batch_padded_seq_len}")
         self.all_metrics.update(
@@ -1057,7 +1106,11 @@ class RayPPOTrainer:
         return data
 
     @torch.no_grad()
-    def _normalize_advantages(self, data: TrainingInputBatch, mini_batch_size: int) -> TrainingInputBatch:
+    def _normalize_advantages(
+        self,
+        data: TrainingInputBatch,
+        mini_batch_boundaries: List[Tuple[int, int]],
+    ) -> TrainingInputBatch:
         advantages = data["advantages"]
         response_mask = data["response_mask"]
 
@@ -1070,11 +1123,8 @@ class RayPPOTrainer:
             data["advantages"] = (advantages - mean) * rstd
 
         # Step 2: Loss reduction normalization per mini-batch
-        num_mini_batches = len(data) // mini_batch_size
         normalized_advantages = torch.zeros_like(advantages)
-        for local_step in range(num_mini_batches):
-            start_idx = local_step * mini_batch_size
-            end_idx = (local_step + 1) * mini_batch_size
+        for start_idx, end_idx in mini_batch_boundaries:
             mini_batch = data[start_idx:end_idx]
             normalized_advantages[start_idx:end_idx] = apply_loss_reduction_to_advantages_minibatch(
                 advantages=mini_batch["advantages"],
@@ -1104,20 +1154,17 @@ class RayPPOTrainer:
         Returns:
             Dict of reduced metrics from training
         """
-        # Compute mini batch size from config (algorithm-level concept)
-        n_samples = self.cfg.generator.n_samples_per_prompt
+        boundaries = data.metadata[f"{model}_mini_batch_boundaries"]
+
         if model == "policy":
-            mini_batch_size = self.cfg.trainer.policy_mini_batch_size * n_samples
             # Normalize advantages for policy training; critic training does not need this
-            data = self._normalize_advantages(data, mini_batch_size)
-        else:
-            mini_batch_size = self.cfg.trainer.critic_mini_batch_size * n_samples
+            data = self._normalize_advantages(data, boundaries)
 
         all_metrics: Dict[str, List[float]] = defaultdict(list)
 
         # Pre-stage all per-DP mini-batch chunks in the object store so that
         # serialization is fully off the critical path during training.
-        all_chunk_refs = self.dispatch.stage_data(model, data, mini_batch_size)
+        all_chunk_refs = self.dispatch.stage_data(model, data, boundaries)
 
         # Training loop over epochs and mini-batches
         for _epoch in range(self.cfg.trainer.update_epochs_per_batch):
