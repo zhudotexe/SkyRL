@@ -30,6 +30,38 @@ from skyrl.train.utils.trainer_utils import (
 )
 
 
+def _maybe_redel_reaggregate_rollout_metrics(
+    generator: GeneratorInterface, concat_generator_outputs: GeneratorOutput
+) -> None:
+    """If ``generator`` is a ReDelGenerator, recompute env-aware rollout metrics
+    over the concatenated generator outputs and write them back in-place.
+
+    ``concatenate_generator_outputs`` re-runs the base (env-blind)
+    ``get_rollout_metrics``, which drops per-env metrics. The ReDel generator
+    exposes ``env_metrics``/``env_classes`` as list-valued keys that the base
+    concat propagates; we just re-run the generator's own aggregator here.
+    """
+    try:
+        from redel_rl.redel_generator import ReDelGenerator
+    except ImportError:
+        return
+    if not isinstance(generator, ReDelGenerator):
+        return
+    # env_metrics/env_classes aren't part of the GeneratorOutput TypedDict — ReDelGenerator
+    # adds them as extra list-valued keys that concatenate_generator_outputs propagates.
+    env_metrics = concat_generator_outputs.get("env_metrics")
+    env_classes = concat_generator_outputs.get("env_classes")
+    if env_metrics is None or env_classes is None:
+        return
+    concat_generator_outputs["rollout_metrics"] = generator.get_rollout_metrics(
+        responses=concat_generator_outputs["response_ids"],
+        rewards=concat_generator_outputs["rewards"],
+        stop_reasons=concat_generator_outputs["stop_reasons"],
+        env_metrics=env_metrics,
+        env_classes=env_classes,
+    )
+
+
 @torch.no_grad()
 async def evaluate(
     eval_dataloader: StatefulDataLoader,
@@ -76,6 +108,7 @@ async def evaluate(
         concat_env_extras.extend(generator_input["env_extras"])
         concat_uids.extend(uids)
     concat_generator_outputs: GeneratorOutput = concatenate_generator_outputs(generator_outputs)
+    _maybe_redel_reaggregate_rollout_metrics(generator, concat_generator_outputs)
 
     # Extract data_sources from env_extras
     concat_data_sources = [env_extra.get("data_source") for env_extra in concat_env_extras]
@@ -184,6 +217,7 @@ async def evaluate_step_wise(
         validate_generator_output(generator_input, generator_output, step_wise=True)
         generator_outputs.append(generator_output)
     concat_generator_outputs: GeneratorOutput = concatenate_generator_outputs(generator_outputs)
+    _maybe_redel_reaggregate_rollout_metrics(generator, concat_generator_outputs)
 
     # Extract data_sources from env_extras
     concat_data_sources = [env_extra.get("data_source") for env_extra in concat_env_extras]
@@ -219,6 +253,9 @@ async def evaluate_step_wise(
             "eval/all/mean_positive_reward": overall_metrics["mean_positive_reward"],
         }
     )
+
+    for key, value in concat_generator_outputs["rollout_metrics"].items():
+        eval_metrics[f"eval/{key}"] = value
 
     # 4. Prepare dumping data
     # TODO[Ben] update this to be cloud-compatible
