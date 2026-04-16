@@ -255,6 +255,9 @@ async def evaluate_step_wise(
     )
 
     for key, value in concat_generator_outputs["rollout_metrics"].items():
+        # ignore multi-step-all/ and redel-agent/ keys
+        if key.startswith("multi-step-all/") or key.startswith("redel-agent/"):
+            continue
         eval_metrics[f"eval/{key}"] = value
 
     # 4. Prepare dumping data
