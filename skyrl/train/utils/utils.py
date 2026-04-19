@@ -97,6 +97,9 @@ def validate_batch_sizes(cfg: SkyRLTrainConfig):
         f"train_batch_size {cfg.trainer.train_batch_size} should be divisible by "
         f"policy_mini_batch_size {cfg.trainer.policy_mini_batch_size}"
     )
+
+    # TODO(Charlie): For step-wise training, the number of sequences per prompt is variable, and
+    # padded mini-batch may not be divisible by dp_size. Should check if we need these assertions.
     policy_mini_batch_size_per_gpu = (
         cfg.trainer.policy_mini_batch_size * cfg.generator.n_samples_per_prompt // policy_dp_size
     )
@@ -294,6 +297,11 @@ def validate_cfg(cfg: SkyRLTrainConfig):
             f"connection. Use an outcome-based estimator (grpo, rloo, maxrl) or disable "
             f"step_wise_trajectories."
         )
+    if cfg.generator.step_wise_trajectories and cfg.trainer.algorithm.loss_reduction == "token_mean_legacy":
+        # TODO(Charlie): this can be fixed, can revisit later.
+        raise ValueError(
+            "`token_mean_legacy` loss reduction is not supported with step-wise training. Use `token_mean` instead."
+        )
 
     assert cfg.trainer.algorithm.loss_reduction in (
         "token_mean",
@@ -304,6 +312,14 @@ def validate_cfg(cfg: SkyRLTrainConfig):
         f"invalid loss_reduction: {cfg.trainer.algorithm.loss_reduction}. "
         f"Must be one of `['token_mean', 'sequence_mean', 'seq_mean_token_sum_norm']`"
     )
+    if cfg.trainer.algorithm.loss_reduction == "seq_mean_token_sum_norm":
+        if cfg.trainer.algorithm.max_seq_len is None:
+            raise ValueError(
+                "`trainer.algorithm.max_seq_len` must be set explicitly when "
+                "`trainer.algorithm.loss_reduction='seq_mean_token_sum_norm'`. "
+                "Choose the total sequence-length normalization constant for your setup; "
+                "this often matches the model context window / vLLM `max_model_len` when appropriate."
+            )
 
     # TODO (erictang000): remove this after deprecation period
     if cfg.trainer.algorithm.use_tis:
