@@ -67,7 +67,7 @@ from skyrl.train.utils import (
     trainer_utils,
 )
 from skyrl.train.utils.logging_utils import log_example
-from skyrl.train.utils.tracking import Tracking
+from skyrl.train.utils.tracking import Tracking, ValidationGenerationsLogger
 from skyrl.train.utils.trainer_utils import (
     GLOBAL_STEP_PREFIX,
     DynamicSamplingState,
@@ -126,6 +126,7 @@ class RayPPOTrainer:
         self._node_ids: Optional[List[str]] = None
 
         self.dynamic_sampling_state: Optional[DynamicSamplingState] = None
+        self.validation_generations_logger = ValidationGenerationsLogger()
 
         self.reward_kl_controller: Optional[Union[FixedKLController, AdaptiveKLController]] = None
         self.dispatch: WorkerDispatch = None
@@ -161,7 +162,7 @@ class RayPPOTrainer:
             A dictionary of evaluation metrics.
         """
         if self.cfg.generator.step_wise_trajectories:
-            eval_metrics = await evaluate_step_wise(
+            eval_metrics, samples = await evaluate_step_wise(
                 eval_dataloader=self.eval_dataloader,
                 generator=self.generator,
                 cfg=self.cfg,
@@ -169,13 +170,15 @@ class RayPPOTrainer:
                 tokenizer=self.tokenizer,
             )
         else:
-            eval_metrics = await evaluate(
+            eval_metrics, samples = await evaluate(
                 eval_dataloader=self.eval_dataloader,
                 generator=self.generator,
                 cfg=self.cfg,
                 global_step=self.global_step,
                 tokenizer=self.tokenizer,
             )
+        if samples:
+            self.validation_generations_logger.log(self.tracker.logger, samples, self.global_step)
         return eval_metrics
 
     async def train(self):

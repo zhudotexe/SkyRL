@@ -1,6 +1,6 @@
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import torch
 from loguru import logger
@@ -62,6 +62,25 @@ def _maybe_redel_reaggregate_rollout_metrics(
     )
 
 
+def _collect_samples(
+    tokenizer: AutoTokenizer,
+    generator_outputs: GeneratorOutput,
+    n_samples: int,
+) -> List[Tuple[str, str, float]]:
+    """Collect (input, output, score) tuples from generator outputs for validation logging."""
+    prompt_ids = generator_outputs.get("prompt_token_ids", [])
+    response_ids = generator_outputs.get("response_ids", [])
+    rewards = generator_outputs.get("rewards", [])
+    n = min(n_samples, len(response_ids))
+    samples = []
+    for i in range(n):
+        prompt_text = tokenizer.decode(prompt_ids[i], skip_special_tokens=False) if i < len(prompt_ids) else ""
+        response_text = tokenizer.decode(response_ids[i], skip_special_tokens=False)
+        reward = rewards[i] if isinstance(rewards[i], (int, float)) else rewards[i][-1]
+        samples.append((prompt_text, response_text, float(reward)))
+    return samples
+
+
 @torch.no_grad()
 async def evaluate(
     eval_dataloader: StatefulDataLoader,
@@ -69,7 +88,8 @@ async def evaluate(
     cfg: SkyRLTrainConfig,
     global_step: int | None,
     tokenizer: AutoTokenizer,
-) -> Dict[str, float]:
+    n_samples_to_log: int = 25,
+) -> Tuple[Dict[str, float], List[Tuple[str, str, float]]]:
     """Runs generation and evaluation of trajectories.
 
     Args:
@@ -79,9 +99,10 @@ async def evaluate(
         global_step (int | None): current global step, or
             `None` to indicate a non-training context (e.g., eval-only)
         tokenizer (AutoTokenizer): tokenizer to use
+        n_samples_to_log (int): number of (input, output, score) samples to return for logging
 
     Returns:
-        Dict[str, float]: evaluation metrics
+        Tuple of (evaluation metrics dict, list of (input, output, score) sample tuples).
     """
 
     # 1. Get all generator outputs
@@ -158,7 +179,10 @@ async def evaluate(
                 eval_metrics,
             )
 
-    return eval_metrics
+    # 5. Collect samples for validation logging
+    samples = _collect_samples(tokenizer, concat_generator_outputs, n_samples_to_log)
+
+    return eval_metrics, samples
 
 
 @torch.no_grad()
@@ -168,7 +192,8 @@ async def evaluate_step_wise(
     cfg: SkyRLTrainConfig,
     global_step: int | None,
     tokenizer: AutoTokenizer,
-) -> Dict[str, float]:
+    n_samples_to_log: int = 25,
+) -> Tuple[Dict[str, float], List[Tuple[str, str, float]]]:
     """Runs generation and evaluation of trajectories for step-wise training.
 
     Currently assumes that the rewards are assigned to the last step of each trajectory.
@@ -180,9 +205,10 @@ async def evaluate_step_wise(
         global_step (int | None): current global step, or
             `None` to indicate a non-training context (e.g., eval-only)
         tokenizer (AutoTokenizer): tokenizer to use
+        n_samples_to_log (int): number of (input, output, score) samples to return for logging
 
     Returns:
-        Dict[str, float]: evaluation metrics
+        Tuple of (evaluation metrics dict, list of (input, output, score) sample tuples).
     """
 
     # 1. Get all generator outputs
@@ -280,4 +306,7 @@ async def evaluate_step_wise(
                 eval_metrics,
             )
 
-    return eval_metrics
+    # 5. Collect samples for validation logging (use last-step-only data)
+    samples = _collect_samples(tokenizer, generator_output_last_step, n_samples_to_log)
+
+    return eval_metrics, samples
