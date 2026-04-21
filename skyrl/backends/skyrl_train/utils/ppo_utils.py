@@ -224,17 +224,25 @@ class BaseFunctionRegistry:
     def _sync_local_to_actor(cls):
         """Sync all local functions to Ray actor."""
         if cls._synced_to_actor:
+            logger.info(f"[{cls._actor_name}] _sync_local_to_actor: already synced, skipping")
             return
         if not ray.is_initialized():
             raise Exception("Ray is not initialized, cannot sync with actor")
 
         try:
+            logger.info(f"[{cls._actor_name}] _sync_local_to_actor: getting/creating actor handle")
             actor = cls._get_or_create_actor()
+            logger.info(f"[{cls._actor_name}] _sync_local_to_actor: actor handle obtained")
             if actor is not None:
-                for name, func in cls._functions.items():
+                names = list(cls._functions.keys())
+                logger.info(f"[{cls._actor_name}] _sync_local_to_actor: pushing {len(names)} funcs: {names}")
+                for i, (name, func) in enumerate(cls._functions.items()):
+                    logger.info(f"[{cls._actor_name}] _sync_local_to_actor: ray.get(register({name})) [{i + 1}/{len(names)}]")
                     func_serialized = cloudpickle.dumps(func)
                     ray.get(actor.register.remote(name, func_serialized))
+                    logger.info(f"[{cls._actor_name}] _sync_local_to_actor: registered {name}")
                 cls._synced_to_actor = True
+                logger.info(f"[{cls._actor_name}] _sync_local_to_actor: done")
         except Exception as e:
             logger.error(f"Error syncing {cls._function_type} to actor: {e}")
             raise e
@@ -242,6 +250,7 @@ class BaseFunctionRegistry:
     @classmethod
     def sync_with_actor(cls):
         """Sync local registry with Ray actor if Ray is available."""
+        logger.info(f"[{cls._actor_name}] sync_with_actor: enter")
         # Only try if Ray is initialized
         if not ray.is_initialized():
             raise Exception("Ray is not initialized, cannot sync with actor")
@@ -251,23 +260,31 @@ class BaseFunctionRegistry:
         # same Python process, and each unit test has ray init/shutdown. This makes cls's attributes
         # outdated (e.g. the _ray_actor points to a stale actor in the previous ray session).
         try:
+            logger.info(f"[{cls._actor_name}] sync_with_actor: probing ray.get_actor")
             _ = ray.get_actor(cls._actor_name)  # this raises exception if the actor is stale
+            logger.info(f"[{cls._actor_name}] sync_with_actor: existing actor found in GCS")
         except ValueError:
+            logger.info(f"[{cls._actor_name}] sync_with_actor: no existing actor, will create fresh")
             cls._ray_actor = None
             cls._synced_to_actor = False
 
         # First, sync our local functions to the actor
+        logger.info(f"[{cls._actor_name}] sync_with_actor: calling _sync_local_to_actor")
         cls._sync_local_to_actor()
+        logger.info(f"[{cls._actor_name}] sync_with_actor: _sync_local_to_actor returned")
 
         actor = cls._get_or_create_actor()
         if actor is None:
             return
 
+        logger.info(f"[{cls._actor_name}] sync_with_actor: ray.get(list_available)...")
         available = ray.get(actor.list_available.remote())
+        logger.info(f"[{cls._actor_name}] sync_with_actor: list_available returned {len(available)} names: {available}")
 
         # Sync any new functions from actor to local registry
         for name in available:
             if name not in cls._functions:
+                logger.info(f"[{cls._actor_name}] sync_with_actor: fetching missing func {name}")
                 func_serialized = ray.get(actor.get.remote(name))
                 if func_serialized is not None:
                     # Deserialize the function
@@ -278,6 +295,7 @@ class BaseFunctionRegistry:
                         # If deserialization fails, skip this function
                         logger.error(f"Error deserializing {name} from actor: {e}")
                         raise e
+        logger.info(f"[{cls._actor_name}] sync_with_actor: exit")
 
     @classmethod
     def register(cls, name: Union[str, StrEnum], func: Callable):

@@ -779,7 +779,9 @@ def initialize_ray(cfg: SkyRLTrainConfig):
 
     # log_to_driver=True allows training progress from skyrl_entrypoint to reach stdout.
     # Infrastructure logs (vLLM, workers) are redirected to log file via os.dup2 in their init.
+    logger.info(f"about to call ray.init with runtime_env env_vars keys: {sorted(env_vars.keys())}")
     ray.init(runtime_env={"env_vars": env_vars}, log_to_driver=True)
+    logger.info("ray.init returned")
 
     if not verbose_logging:
         logger.info(f"Infrastructure logs will be written to: {log_file}")
