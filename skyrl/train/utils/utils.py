@@ -303,6 +303,13 @@ def validate_cfg(cfg: SkyRLTrainConfig):
             "`token_mean_legacy` loss reduction is not supported with step-wise training. Use `token_mean` instead."
         )
 
+    if cfg.generator.merge_stepwise_output and not cfg.generator.step_wise_trajectories:
+        raise ValueError(
+            "`generator.merge_stepwise_output=True` requires `generator.step_wise_trajectories=True`. "
+            "Prefix-aware merging operates on step-wise GeneratorOutput entries (trajectory_ids + "
+            "is_last_step), which only exist when step-wise training is enabled."
+        )
+
     assert cfg.trainer.algorithm.loss_reduction in (
         "token_mean",
         "token_mean_legacy",
@@ -683,8 +690,7 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
             logger.info(f"Exporting {var_name} to ray runtime env")
             env_vars[var_name] = value
 
-    if _SKYRL_USE_NEW_INFERENCE:
-        env_vars["_SKYRL_USE_NEW_INFERENCE"] = "1"
+    env_vars["_SKYRL_USE_NEW_INFERENCE"] = "1" if _SKYRL_USE_NEW_INFERENCE else "0"
 
     if SKYRL_LD_LIBRARY_PATH_EXPORT:
         # export `LD_LIBRARY_PATH` to ray runtime env.

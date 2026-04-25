@@ -172,6 +172,9 @@ class MegatronConfig(BaseConfig):
     empty_cuda_cache: Optional[bool] = None
     model_config_kwargs: dict = field(default_factory=dict)
     dist_ckpt_optim_fully_reshardable: bool = False
+    freeze_moe_router: bool = False
+    """If True, freeze MoE router parameters so they are not updated during training. No-op on
+    non-MoE models."""
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +539,11 @@ class GeneratorConfig(BaseConfig):
     """Can differ from the trainer's ``rope_scaling``, useful for thinking models."""
     rope_theta: Optional[float] = None
     step_wise_trajectories: bool = False
+    vision_language_generator: bool = False
+    """If True, use SkyRLVLMGymGenerator (multi-modal text+image rollouts)"""
+    merge_stepwise_output: bool = False
+    """When True (and step_wise_trajectories is True), apply prefix-aware merging
+    to collapse multi-turn step-wise sequences into single sequences before training."""
 
     def __post_init__(self):
 
