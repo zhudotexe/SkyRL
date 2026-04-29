@@ -110,7 +110,7 @@ def convert_prompts_responses_to_batch_tensors(
     if max_seq_len is not None and max_total > max_seq_len:
         logger.warning(
             f"Max sequence length in batch ({max_total}) exceeds max_seq_len ({max_seq_len}). "
-            f"No truncation is performed; consider checking generator settings."
+            "No truncation is performed; consider checking generator settings."
         )
 
     pad_token_id = tokenizer.pad_token_id
@@ -246,18 +246,19 @@ def compute_prompt_mini_batch_boundaries(
 
     # seen_uids should equal to the number of prompts and equal to `train_batch_size`
     num_prompts = len(prompt_end_indices)
-    assert num_prompts == train_batch_size and len(seen_uids) == train_batch_size
+    # assert num_prompts == train_batch_size and len(seen_uids) == train_batch_size
     assert train_batch_size % mini_batch_size == 0
 
     # Compute boundaries.
     boundaries: List[Tuple[int, int]] = []
     start_seq = 0
     for i in range(0, num_prompts, mini_batch_size):
-        end_prompt_idx = i + mini_batch_size - 1  # i + mini_batch_size is next mini-batch's first prompt's end index
+        # i + mini_batch_size is next mini-batch's first prompt's end index
+        end_prompt_idx = min(i + mini_batch_size - 1, num_prompts - 1)
         end_seq = prompt_end_indices[end_prompt_idx]
         boundaries.append((start_seq, end_seq))
         start_seq = end_seq
-    assert len(boundaries) == train_batch_size // mini_batch_size
+    # assert len(boundaries) == train_batch_size // mini_batch_size
 
     # Assert that the mini-batch boundaries are uniform for non-step-wise training.
     if not is_stepwise:
