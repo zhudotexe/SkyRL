@@ -1,4 +1,5 @@
-from collections import defaultdict
+import json
+from collections import defaultdict, OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -60,6 +61,103 @@ def _maybe_redel_reaggregate_rollout_metrics(
         env_metrics=env_metrics,
         env_classes=env_classes,
     )
+
+
+def _maybe_redel_dump_subagent_trajectories(
+    generator: GeneratorInterface,
+    concat_generator_outputs: GeneratorOutput,
+    tokenizer: AutoTokenizer,
+    dump_dir_path: Path,
+) -> None:
+    """If ``generator`` is a ReDelGenerator, dump the per-rollout fork/join tree to
+    ``subagent_trajectories.jsonl`` alongside the standard per-dataset eval dumps.
+
+    Reads the ``redel_step_records`` extra key the generator stashes on its output (see the
+    CONTRACT comment in redel_generator.py). The standard ``dump_per_dataset_eval_results``
+    only decodes the flat per-step response ids and can't tell root from subagent steps;
+    this reconstructs, per eval sample (``instance_id``), the set of agents and each agent's
+    steps. No-op for non-ReDel generators or if the key is absent.
+    """
+    try:
+        from redel_rl.redel_generator import ReDelGenerator
+    except ImportError:
+        return
+    if not isinstance(generator, ReDelGenerator):
+        return
+    records = concat_generator_outputs.get("redel_step_records")
+    if not records:
+        return
+    response_ids = concat_generator_outputs["response_ids"]
+    # Authoritative per-step score: matches what dump_per_dataset_eval_results writes, and
+    # reflects generator post-processing (zero_reward_on_non_stop / overlong filtering) that
+    # the record's raw token_rewards predate. Token-level rewards are summed to a scalar.
+    rewards = concat_generator_outputs["rewards"]
+
+    def _scalar_reward(idx: int):
+        r = rewards[idx]
+        return float(sum(r)) if isinstance(r, list) else float(r)
+
+    # Group records by rollout, then by agent. A rollout is keyed by the FULL trajectory id
+    # (instance_id, repetition_id), NOT instance_id alone: at eval all steps of a rollout —
+    # root and every subagent — share the root's trajectory_id (run_agent_loop bakes it in via
+    # functools.partial and fork reuses it), and instance_id is the *group* id shared across
+    # GRPO repetitions. Keying on instance_id alone would merge the N>1 samples-per-prompt
+    # rollouts together and collide every rollout's agent_id="root". Agents within one rollout
+    # are distinguished by agent_id. Each agent spans multiple step records; we keep every
+    # step's decoded response and take agent-level fields from the latest record (subagent
+    # bookkeeping is only complete on the agent's last step).
+    by_rollout: "OrderedDict[tuple, OrderedDict[str, dict]]" = OrderedDict()
+    for i, rec in enumerate(records):
+        rollout_key = (rec["instance_id"], rec["repetition_id"])
+        agents = by_rollout.setdefault(rollout_key, OrderedDict())
+        agent = agents.setdefault(rec["agent_id"], {"meta": rec, "steps": []})
+        agent["meta"] = rec  # latest wins
+        agent["steps"].append(
+            {
+                "step_idx": len(agent["steps"]),
+                "is_last": rec["is_last"],
+                "reward": _scalar_reward(i),
+                "response": tokenizer.decode(response_ids[i]),
+            }
+        )
+
+    filename = dump_dir_path / "subagent_trajectories.jsonl"
+    with open(filename, "w") as f:
+        for (instance_id, repetition_id), agents in by_rollout.items():
+            agent_list = []
+            for agent_id, agent in agents.items():
+                m = agent["meta"]
+                agent_list.append(
+                    {
+                        "agent_id": agent_id,
+                        "depth": m["depth"],
+                        "num_turns": m["num_turns"],
+                        "stop_reason": m["stop_reason"],
+                        # agent's terminal score (its last step); see _scalar_reward note above
+                        "reward": agent["steps"][-1]["reward"],
+                        "subagent_ids": m["subagent_ids"],
+                        "subagent_join_turns": m["subagent_join_turns"],
+                        "n_children": m["n_children"],
+                        "n_children_recursive": m["n_children_recursive"],
+                        "max_depth": m["max_depth"],
+                        "flags_for_reward": m["flags_for_reward"],
+                        "steps": agent["steps"],
+                    }
+                )
+            # root (depth 0) first, then by depth/id so the tree reads top-down
+            agent_list.sort(key=lambda a: (a["depth"], a["agent_id"]))
+            root = next((a for a in agent_list if a["depth"] == 0), None)
+            entry = {
+                "instance_id": instance_id,
+                "repetition_id": repetition_id,
+                "num_agents": len(agent_list),
+                "max_depth": max((a["depth"] for a in agent_list), default=0),
+                "root_reward": root["reward"] if root else None,
+                "agents": agent_list,
+            }
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    logger.info(f"Dumped redel subagent trajectories ({len(by_rollout)} rollouts) to {filename}")
 
 
 def _collect_samples(
@@ -304,6 +402,10 @@ async def evaluate_step_wise(
                 concat_all_envs,
                 concat_env_extras,
                 eval_metrics,
+            )
+            # additive ReDel-only dump of the fork/join tree; no-op for other generators
+            _maybe_redel_dump_subagent_trajectories(
+                generator, concat_generator_outputs, tokenizer, data_save_dir
             )
 
     # 5. Collect samples for validation logging (use last-step-only data)
