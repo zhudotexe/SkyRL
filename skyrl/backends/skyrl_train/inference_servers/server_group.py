@@ -11,7 +11,11 @@ from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from skyrl.backends.skyrl_train.inference_servers.common import (
+    SERVER_PORT_STRIDE,
     ServerInfo,
+)
+from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
+    build_engine_runtime_env,
 )
 from skyrl.backends.skyrl_train.inference_servers.protocols import ServerActorProtocol
 from skyrl.backends.skyrl_train.inference_servers.server_pool import ServerActorPool
@@ -51,6 +55,7 @@ class ServerGroup:
         enable_pd: bool = False,
         nixl_side_channel_base: int = 5600,
         server_actor_cls: Optional[Type[ServerActorProtocol]] = None,
+        use_expandable_segments: bool = False,
         **server_actor_kwargs: Any,
     ):
         """
@@ -89,6 +94,7 @@ class ServerGroup:
         self._pool: Optional[ServerActorPool] = None
         self._internal_pg: Optional[PlacementGroup] = None
         self._server_actor_kwargs = server_actor_kwargs
+        self._use_expandable_segments = use_expandable_segments
         self._external_pg = placement_group
 
         # Extract the raw PG, reordered indices, and GPU IDs from ResolvedPlacementGroup.
@@ -134,6 +140,10 @@ class ServerGroup:
 
     def _create_actor_class(self, pg: PlacementGroup, start_bundle_idx: int) -> Any:
         """Create actor class with scheduling constraints for a specific bundle."""
+        # Engine-actor runtime_env (env vars applied before CUDA init and inherited by the
+        # child vLLM workers). Currently just the expandable_segments allocator, which is
+        # safe with sleep mode on vLLM >= 0.20.1.
+        runtime_env = build_engine_runtime_env(use_expandable_segments=self._use_expandable_segments)
         return ray.remote(self._server_actor_cls).options(
             num_gpus=0,  # GPU allocation managed by placement group
             num_cpus=COLOCATED_ACTOR_CPU_FRACTION,
@@ -142,6 +152,7 @@ class ServerGroup:
                 placement_group_capture_child_tasks=True,
                 placement_group_bundle_index=start_bundle_idx,
             ),
+            runtime_env=runtime_env,
         )
 
     def _get_bundle_indices_for_server(self, server_idx: int) -> List[int]:
@@ -184,7 +195,7 @@ class ServerGroup:
 
             actor = ServerActorClass.remote(
                 self._cli_args,
-                self._start_port + server_idx,
+                self._start_port + server_idx * SERVER_PORT_STRIDE,
                 server_idx=server_idx,
                 bundle_indices=bundle_indices,
                 dp_size=self._num_servers if self._enable_dp else -1,

@@ -9,7 +9,9 @@
     "training_backends",
     "multi_turn_text2sql",
     "search",
-    "flash_rl",
+    "geometry3k",
+    "visgym",
+    "quantized_rollouts",
     "mini_swe_agent",
     "openenv"
   ]

@@ -21,7 +21,7 @@ uv run --isolated --extra fsdp --env-file .env.llm_judge -m examples.train.llm_a
   trainer.algorithm.advantage_estimator="grpo" \
   trainer.policy.model.path="Qwen/Qwen2.5-1.5B-Instruct" \
   trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \
   trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
   generator.inference_engine.num_engines=$NUM_INFERENCE_ENGINES \
@@ -43,7 +43,6 @@ uv run --isolated --extra fsdp --env-file .env.llm_judge -m examples.train.llm_a
   generator.inference_engine.backend=vllm \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.weight_sync_backend=nccl \
-  generator.inference_engine.async_engine=true \
   generator.batched=true \
   generator.n_samples_per_prompt=5 \
   generator.inference_engine.gpu_memory_utilization=0.8 \

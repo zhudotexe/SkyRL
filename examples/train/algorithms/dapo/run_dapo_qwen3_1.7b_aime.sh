@@ -16,8 +16,7 @@ LOGGER="wandb"  # change to "console" to print to stdout
 
 CLIP_RATIO_LOW=0.2
 CLIP_RATIO_HIGH=0.28
-# use dr. grpo loss reduction
-LOSS_REDUCTION="token_mean"
+LOSS_REDUCTION="token_mean_legacy"
 # applies overlong filtering (but not soft overlong punishment)
 APPLY_OVERLONG_FILTERING=true
 # apply soft overlong punishment with custom trainer impl in main_dapo.py
@@ -38,7 +37,7 @@ TRAIN_BATCH_SIZE=512
 MINI_BATCH_SIZE=32
 N_SAMPLES_PER_PROMPT=16
 EVAL_N_SAMPLES_PER_PROMPT=32
-ENFORCE_EAGER=true # cuda graphs can cause some instability
+ENFORCE_EAGER=true # original DAPO recipe used enforce eager due to instability with vLLM then. TODO: reproduce DAPO with enforce eager `False`
 LR=1e-6
 
 uv run --isolated --extra fsdp -m examples.train.algorithms.dapo.main_dapo \
@@ -60,7 +59,7 @@ uv run --isolated --extra fsdp -m examples.train.algorithms.dapo.main_dapo \
   trainer.algorithm.clip_ratio_c=$CLIP_RATIO_C \
   trainer.policy.model.path="$MODEL_NAME" \
   trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.placement.policy_num_nodes=$NUM_NODES \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS_PER_NODE \
   trainer.policy.fsdp_config.fsdp_size=$NUM_GPUS_PER_NODE \
@@ -87,7 +86,6 @@ uv run --isolated --extra fsdp -m examples.train.algorithms.dapo.main_dapo \
   generator.inference_engine.backend=vllm \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.weight_sync_backend=nccl \
-  generator.inference_engine.async_engine=false \
   generator.batched=true \
   environment.env_class=aime \
   generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \

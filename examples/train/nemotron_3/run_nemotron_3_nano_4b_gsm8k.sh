@@ -28,7 +28,8 @@ MEGATRON_CP=1
 NUM_INFERENCE_ENGINES=8
 INFERENCE_TP=1
 
-uv run --isolated --extra megatron --extra mamba -m skyrl.train.entrypoints.main_base \
+
+uv run --isolated --extra megatron -m skyrl.train.entrypoints.main_base \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
   trainer.algorithm.advantage_estimator="grpo" \
@@ -46,7 +47,7 @@ uv run --isolated --extra megatron --extra mamba -m skyrl.train.entrypoints.main
   trainer.ref.megatron_config.tensor_model_parallel_size=$MEGATRON_TP \
   trainer.ref.megatron_config.context_parallel_size=$MEGATRON_CP \
   trainer.ref.megatron_config.pipeline_model_parallel_size=$MEGATRON_PP \
-  trainer.use_sample_packing=true \
+  trainer.remove_microbatch_padding=true \
   trainer.epochs=20 \
   trainer.eval_batch_size=1024 \
   trainer.eval_before_train=false \
@@ -64,7 +65,6 @@ uv run --isolated --extra megatron --extra mamba -m skyrl.train.entrypoints.main
   generator.inference_engine.backend=$INFERENCE_BACKEND \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.weight_sync_backend=nccl \
-  generator.inference_engine.async_engine=true \
   generator.batched=true \
   environment.env_class=gsm8k \
   generator.n_samples_per_prompt=5 \

@@ -57,7 +57,7 @@ uv run --isolated --extra megatron --with blobfile -m skyrl.train.entrypoints.ma
   trainer.ref.megatron_config.expert_tensor_parallel_size=$MEGATRON_ETP \
   trainer.policy.megatron_config.transformer_config_kwargs.num_layers_in_last_pipeline_stage=13 \
   trainer.ref.megatron_config.transformer_config_kwargs.num_layers_in_last_pipeline_stage=13 \
-  trainer.use_sample_packing=true \
+  trainer.remove_microbatch_padding=true \
   trainer.flash_attn=$FLASH_ATTN \
   trainer.epochs=20 \
   trainer.eval_batch_size=1024 \
@@ -76,7 +76,6 @@ uv run --isolated --extra megatron --with blobfile -m skyrl.train.entrypoints.ma
   generator.inference_engine.backend=$INFERENCE_BACKEND \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.weight_sync_backend=nccl \
-  generator.inference_engine.async_engine=true \
   generator.batched=true \
   environment.env_class=gsm8k \
   generator.n_samples_per_prompt=5 \

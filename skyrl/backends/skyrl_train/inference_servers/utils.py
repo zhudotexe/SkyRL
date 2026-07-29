@@ -1,10 +1,14 @@
 import copy
 import json
+import logging
 from argparse import Namespace
 from typing import Any, Dict, List, Optional
 
 from skyrl.backends.skyrl_train.inference_servers.new_inference_worker_wrap import (
     VLLM_NEW_INFERENCE_WORKER_EXTENSION_CLS,
+)
+from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+    SKYRL_LORA_ADAPTER_NAME,
 )
 from skyrl.backends.skyrl_train.weight_sync import get_transfer_strategy
 from skyrl.train.config import (
@@ -13,6 +17,43 @@ from skyrl.train.config import (
     get_config_as_dict,
 )
 
+logger = logging.getLogger(__name__)
+
+
+def _uses_lora_weight_sync(cfg: SkyRLTrainConfig) -> bool:
+    """Return True when the trainer syncs LoRA adapters (not merged weights).
+
+    FSDP always syncs LoRA adapters when ``lora.rank > 0``.
+    Megatron merges LoRA into the base weights by default
+    (``merge_lora=True``), so the inference engine should not enable LoRA.
+    """
+    if cfg.trainer.policy.model.lora.rank <= 0:
+        return False
+    if cfg.trainer.strategy == "megatron":
+        return not cfg.trainer.policy.megatron_config.lora_config.merge_lora
+    return True
+
+
+def resolve_policy_model_name(cfg: SkyRLTrainConfig) -> str:
+    """Return the model identifier the inference engine knows the policy by.
+
+    Mirrors the weight-sync code path: when the worker registers a LoRA
+    adapter on the inference engine (FSDP + LoRA, or Megatron + LoRA with
+    ``merge_lora=False``), the policy is that adapter and callers must pass
+    ``SKYRL_LORA_ADAPTER_NAME`` as ``model`` on data-plane calls. Otherwise
+    — including Megatron + LoRA with ``merge_lora=True``, where merged
+    weights are pushed as a full weight update — the policy is the base
+    model itself, or its configured served alias.
+
+    This is the single source of truth for "which name does the inference
+    server know the policy by?" and should be used wherever a caller needs
+    to issue a ``generate``/``sample``/``chat_completion``/``completion`` /
+    ``render_chat_completion`` request against the current policy.
+    """
+    if _uses_lora_weight_sync(cfg):
+        return SKYRL_LORA_ADAPTER_NAME
+    return cfg.generator.inference_engine.served_model_name or cfg.trainer.policy.model.path
+
 
 # TODO: Add a test for validation
 def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
@@ -20,7 +61,20 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     from vllm import AsyncEngineArgs
     from vllm.config import WeightTransferConfig
     from vllm.entrypoints.openai.cli_args import FrontendArgs
+    from vllm.platforms import current_platform
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    # This function may run a GPU-less Ray head
+    # node, where ``current_platform`` resolves to ``UnspecifiedPlatform`` with
+    # ``device_type == ""``. vLLM's ``add_cli_args`` walks ``VllmConfig`` defaults
+    # and instantiates ``DeviceConfig()`` (device="auto"), which in turn runs
+    # ``DeviceConfig.__post_init__`` and raises ``Failed to infer device type``.
+    # Explicitly pin the platform's device type to ``cuda`` so the autodetection
+    # path in ``DeviceConfig.__post_init__`` succeeds during arg parsing.
+    # NOTE: mutating current_platform.device_type relies on vLLM 0.20.2's singleton
+    # initialization where instance attrs shadow class attrs. This should be re-verified on vLLM bumps.
+    if not current_platform.device_type:
+        current_platform.device_type = "cuda"
 
     # Create common CLI args namespace
     parser = FlexibleArgumentParser()
@@ -59,18 +113,45 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
         ),
         language_model_only=ie_cfg.language_model_only,
         mm_processor_cache_gb=0,
+        kv_cache_metrics=True,
+        # models with custom modeling code (MiMo, Qwen3.5, DeepSeek-V3, ...) require it to load.
+        # Overridable via generator.inference_engine.engine_init_kwargs.trust_remote_code below.
+        trust_remote_code=True,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
 
-    # Add LoRA params if enabled
-    if cfg.trainer.policy.model.lora.rank > 0 and cfg.trainer.strategy != "megatron":
+    # Enable LoRA on the inference engine only when the trainer will sync
+    # LoRA adapters (not merged weights).  Megatron merges by default
+    # (merge_lora=True), so the inference engine must NOT have LoRA wrapping.
+    if _uses_lora_weight_sync(cfg):
+        lora_cfg = cfg.trainer.policy.model.lora
         args.enable_lora = True
-        args.max_lora_rank = cfg.trainer.policy.model.lora.rank
-        args.max_loras = 1
+        args.max_lora_rank = lora_cfg.rank
+        args.max_loras = lora_cfg.max_loras
+        if lora_cfg.max_cpu_loras is not None:
+            args.max_cpu_loras = lora_cfg.max_cpu_loras
         args.fully_sharded_loras = ie_cfg.fully_sharded_loras
 
-    # Add any extra engine_init_kwargs
+        if not cfg.trainer.placement.colocate_all:
+            lora_path = cfg.trainer.policy.model.lora.lora_sync_path
+            logger.warning(
+                "LoRA weight sync is enabled but training and inference are not "
+                "colocated (placement.colocate_all=false). The trainer saves LoRA "
+                "adapters to disk for the inference engine to load, so both must "
+                "share a filesystem. Set trainer.policy.model.lora.lora_sync_path "
+                "to a shared mount (current value: %s).",
+                lora_path,
+            )
+    else:
+        args.enable_lora = False
+
+    # Speculative decoding (e.g. MTP): passed straight through to vLLM's speculative_config.
+    if ie_cfg.speculative_config is not None:
+        spec_cfg = get_config_as_dict(ie_cfg.speculative_config)
+        args.speculative_config = spec_cfg
+        logger.info(f"vLLM speculative decoding enabled: speculative_config={spec_cfg}")
+
     engine_kwargs = get_config_as_dict(ie_cfg.engine_init_kwargs)
     for key, value in engine_kwargs.items():
         setattr(args, key, value)

@@ -25,7 +25,7 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
   trainer.algorithm.kl_estimator_type=$KL_ESTIMATOR_TYPE \
   trainer.policy.model.path="Qwen/Qwen2.5-1.5B-Instruct" \
   trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \
   trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
   generator.inference_engine.num_engines=$NUM_GPUS \
@@ -46,7 +46,6 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
   generator.inference_engine.backend=vllm \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.weight_sync_backend=nccl \
-  generator.inference_engine.async_engine=true \
   generator.batched=true \
   environment.env_class=gsm8k \
   generator.n_samples_per_prompt=5 \

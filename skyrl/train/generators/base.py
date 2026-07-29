@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
 
 import torch
 
-from skyrl.backends.skyrl_train.inference_engines.base import ConversationType
+from skyrl.backends.skyrl_train.inference_servers.base import ConversationType
 
 TrainingPhase = Literal["train", "eval"]
 
@@ -42,9 +42,17 @@ class GeneratorOutput(TypedDict):
     rollout_metrics: Optional[Dict[str, Any]]
     rollout_logprobs: Optional[List[List[float]]]
     trajectory_ids: Optional[List[TrajectoryID]]
+    # Wall-clock generation time (seconds) for each trajectory, with one entry per
+    # trajectory in the input batch (i.e. per ``agent_loop`` call). Used by the fully
+    # async trainer to compute per-group / intra-group completion-time metrics.
+    trajectory_generation_times: Optional[List[float]]
     rollout_expert_indices: Optional[List[List[List[List[int]]]]]  # [batch_size, seq_len, layer_num, topk]
     # Applicable only for step-wise training
     is_last_step: Optional[List[bool]]
+    # Per-row env metrics (one dict per row in the flattened batch). Used by
+    # ``dump_per_dataset_eval_results`` to surface env-specific info (e.g. RLM's
+    # ``rlm_metadata``) in eval JSONL dumps.
+    env_metrics: Optional[List[Dict[str, Any]]]
     # Applicable only for vision-language models
     pixel_values: Optional[List[torch.Tensor]]
     image_grid_thw: Optional[List[torch.Tensor]]

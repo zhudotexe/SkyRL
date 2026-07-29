@@ -27,7 +27,7 @@ uv run --isolated --extra fsdp --extra miniswe --env-file examples/train/mini_sw
   trainer.algorithm.advantage_estimator="grpo" \
   trainer.policy.model.path="Qwen/Qwen3-8B" \
   trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \
   trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
   trainer.placement.policy_num_nodes=$NNODES \
@@ -54,11 +54,7 @@ uv run --isolated --extra fsdp --extra miniswe --env-file examples/train/mini_sw
   trainer.algorithm.use_kl_loss=true \
   generator.inference_engine.backend=vllm \
   generator.inference_engine.run_engines_locally=True \
-  generator.inference_engine.enable_http_endpoint=True \
-  generator.inference_engine.http_endpoint_host='127.0.0.1' \
-  generator.inference_engine.http_endpoint_port=8001 \
   generator.inference_engine.weight_sync_backend=nccl \
-  generator.inference_engine.async_engine=true \
   generator.batched=true \
   generator.n_samples_per_prompt=4 \
   generator.inference_engine.gpu_memory_utilization=0.8 \

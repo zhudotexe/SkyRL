@@ -2,13 +2,12 @@
 set -xeuo pipefail
 
 export CI=true
-export _SKYRL_USE_NEW_INFERENCE=1
 # Prepare datasets used in tests.
 uv run examples/train/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
 uv run examples/train/search/searchr1_dataset.py --local_dir $HOME/data/searchR1 --split test
 
 # Run all non-megatron tests
-uv run --directory . --isolated --extra dev --extra fsdp pytest -s tests/backends/skyrl_train/gpu/gpu_ci -m "not (integrations or megatron)"
+uv run --directory . --isolated --extra dev --extra fsdp pytest -s tests/backends/skyrl_train/gpu/gpu_ci -m "not (integrations or megatron)" --ignore=tests/backends/skyrl_train/gpu/gpu_ci/megatron
 
 ## TODO: enable integrations
 # # Run tests for "integrations" folder
@@ -20,13 +19,3 @@ uv run --directory . --isolated --extra dev --extra fsdp pytest -s tests/backend
 #     echo "Skipping integrations tests. Failed to execute uv add command"
 #     echo "$add_integrations"
 # fi
-
-# TODO (sumanthrh): Migrate flashrl to vllm 0.16.0 and re-enable integration test
-# Run tests for vllm 0.9.2
-# TODO (sumanthrh): We should have a better way to override without pinning a flash-attn wheel
-# uv run --isolated --extra fsdp --extra dev \
-#     --with vllm==0.9.2 \
-#     --with transformers==4.53.0 \
-#     --with torch==2.7.0 \
-#     --with "flash-attn@https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" \
-#     -- pytest -s -vvv tests/backends/skyrl_train/gpu/gpu_ci/test_engine_generation.py::test_token_based_generation

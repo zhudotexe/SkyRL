@@ -1,15 +1,19 @@
 import asyncio
-import traceback
 import sys
+import traceback
+
 from loguru import logger
-from skyrl.train.trainer import RayPPOTrainer
 from tqdm import tqdm
-from skyrl.train.utils import Timer
+
+from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
+    get_sampling_params_for_backend,
+)
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.train.generators.base import GeneratorOutput
-from skyrl.train.utils.trainer_utils import ResumeMode
 from skyrl.train.generators.utils import prepare_generator_input
-from skyrl.backends.skyrl_train.inference_engines.utils import get_sampling_params_for_backend
+from skyrl.train.trainer import RayPPOTrainer
+from skyrl.train.utils import Timer
+from skyrl.train.utils.trainer_utils import ResumeMode
 
 
 class AsyncRayPPOTrainer(RayPPOTrainer):
@@ -34,7 +38,7 @@ class AsyncRayPPOTrainer(RayPPOTrainer):
 
         # sync weights to inference engines
         with Timer("sync_weights_to_inference_engines"):
-            await self.async_sync_policy_weights_to_inference_engines()
+            await self.dispatch.save_weights_for_sampler()
 
         # Eval before training
         if self.cfg.trainer.eval_interval > 0 and self.cfg.trainer.eval_before_train:
@@ -47,63 +51,73 @@ class AsyncRayPPOTrainer(RayPPOTrainer):
         start_epoch = self.global_step // len(self.train_dataloader)
         # Start from step 1
         self.global_step += 1
-        for epoch in range(start_epoch, self.cfg.trainer.epochs):
-            # while this is just off by one, you can image a more general queue based approach
-            # where the generation buffer holds a list of objects that the trainer can read from
-            # bit by bit.
-            generation_buffer = asyncio.Queue(maxsize=1)
-            self.sync_finished = asyncio.Event()
-            self.generation_ack = asyncio.Event()
+        self._profiler_start()
+        try:
+            for epoch in range(start_epoch, self.cfg.trainer.epochs):
+                # while this is just off by one, you can image a more general queue based approach
+                # where the generation buffer holds a list of objects that the trainer can read from
+                # bit by bit.
+                generation_buffer = asyncio.Queue(maxsize=1)
+                self.sync_finished = asyncio.Event()
+                self.generation_ack = asyncio.Event()
 
-            # start generator task
-            generator_task = asyncio.create_task(self._run_generate_loop(generation_buffer))
+                # start generator task
+                generator_task = asyncio.create_task(self._run_generate_loop(generation_buffer))
 
-            for idx in range(len(self.train_dataloader)):
-                with Timer("step", self.all_timings):
-                    status = await self._run_training(generation_buffer)
+                for idx in range(len(self.train_dataloader)):
+                    with Timer("step", self.all_timings):
+                        status = await self._run_training(generation_buffer)
 
-                    # request the generation loop that we should sync sometime soon.
-                    if idx != len(self.train_dataloader) - 1:
-                        await self.generation_ack.wait()
+                        # request the generation loop that we should sync sometime soon.
+                        if idx != len(self.train_dataloader) - 1:
+                            await self.generation_ack.wait()
 
-                    # sync weights
-                    async with Timer("sync_weights", self.all_timings):
-                        await self.async_sync_policy_weights_to_inference_engines()
+                        # sync weights
+                        async with Timer("sync_weights", self.all_timings):
+                            await self.dispatch.save_weights_for_sampler()
 
-                    self.sync_finished.set()
-                    self.generation_ack.clear()
+                        self.sync_finished.set()
+                        self.generation_ack.clear()
 
-                # 5. set logs
-                logger.info(status)
-                # log epoch info
-                self.all_metrics.update({"trainer/epoch": epoch, "trainer/global_step": self.global_step})
-                self.tracker.log(self.all_metrics, step=self.global_step)
-                self.all_metrics = {}
-                pbar.update(1)
+                    # One profiler step per global step.
+                    self._profiler_step()
 
-                if self.cfg.trainer.eval_interval > 0 and (
-                    self.global_step % self.cfg.trainer.eval_interval == 0
-                    or self.global_step == self.total_training_steps
-                ):
-                    with Timer("eval", self.all_timings):
-                        eval_metrics = await self.eval()
-                        self.all_metrics.update(eval_metrics)
-                if self.cfg.trainer.ckpt_interval > 0 and self.global_step % self.cfg.trainer.ckpt_interval == 0:
-                    with Timer("save_checkpoints", self.all_timings):
-                        self.save_checkpoints()
-                if self.cfg.trainer.hf_save_interval > 0 and self.global_step % self.cfg.trainer.hf_save_interval == 0:
-                    with Timer("save_hf_model", self.all_timings):
-                        self.save_models()
-                self.tracker.log({"timing/" + k: v for k, v in self.all_timings.items()}, step=self.global_step)
-                self.all_timings = {}
-                self.global_step += 1
+                    # 5. set logs
+                    logger.info(status)
+                    # log epoch info
+                    self.all_metrics.update({"trainer/epoch": epoch, "trainer/global_step": self.global_step})
+                    self.tracker.log(self.all_metrics, step=self.global_step)
+                    self.all_metrics = {}
+                    pbar.update(1)
 
-            if self.cfg.trainer.update_ref_every_epoch and self.ref_model is not None:
-                with Timer("update_ref_with_policy", self.all_timings):
-                    await asyncio.to_thread(self.update_ref_with_policy)
+                    if self.cfg.trainer.eval_interval > 0 and (
+                        self.global_step % self.cfg.trainer.eval_interval == 0
+                        or self.global_step == self.total_training_steps
+                    ):
+                        with Timer("eval", self.all_timings):
+                            eval_metrics = await self.eval()
+                            self.all_metrics.update(eval_metrics)
+                    if self.cfg.trainer.ckpt_interval > 0 and self.global_step % self.cfg.trainer.ckpt_interval == 0:
+                        with Timer("save_checkpoints", self.all_timings):
+                            self.save_checkpoints()
+                    if (
+                        self.cfg.trainer.hf_save_interval > 0
+                        and self.global_step % self.cfg.trainer.hf_save_interval == 0
+                    ):
+                        with Timer("save_hf_model", self.all_timings):
+                            self.save_models()
+                    self.tracker.log({"timing/" + k: v for k, v in self.all_timings.items()}, step=self.global_step)
+                    self.all_timings = {}
+                    self.global_step += 1
 
-            # cancel generation task for this epoch
-            generator_task.cancel()
+                if self.cfg.trainer.update_ref_every_epoch and self.ref_model is not None:
+                    with Timer("update_ref_with_policy", self.all_timings):
+                        await asyncio.to_thread(self.update_ref_with_policy)
+
+                # cancel generation task for this epoch
+                generator_task.cancel()
+        finally:
+            self._profiler_stop()
 
         pbar.close()
         if self.cfg.trainer.ckpt_interval > 0:
@@ -175,7 +189,7 @@ class AsyncRayPPOTrainer(RayPPOTrainer):
                 # generation phase
                 async with Timer("generate", self.all_timings):
                     generator_output: GeneratorOutput = await self.generate(generator_input)
-                    generator_output = self.postprocess_generator_output(generator_output, uids)
+                    generator_output, uids = self.postprocess_generator_output(generator_output, uids)
 
                 # Add to generation buffer
                 await generation_buffer.put((generator_output, uids))
@@ -193,11 +207,3 @@ class AsyncRayPPOTrainer(RayPPOTrainer):
             logger.error(f"Generator errored out with exception: {e}")
             logger.error(f"Traceback: \n{traceback.format_exc()}")
             sys.exit(1)
-
-    async def async_sync_policy_weights_to_inference_engines(self):
-        return await self.policy_model.async_run_method(
-            "pass_through",
-            "broadcast_to_inference_engines",
-            self.inference_engine_client,
-            self.cfg.generator.inference_engine,
-        )

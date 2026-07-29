@@ -12,9 +12,6 @@
 
 # Overview
 
-> [!IMPORTANT]
-> **Note:** SkyRL is undergoing a repo reorganization into the [`skyrl/`](./skyrl) folder, which unifies the skyrl libraries below into a single package. The existing packages below are fully functional but will be migrated to new paths shortly. For full [Tinker API](https://docs.skyrl.ai/docs/tinker/overview) support please use the `skyrl/` folder. See the [Tinker Quickstart docs](https://docs.skyrl.ai/docs/tinker/quickstart) to get started. See issue: https://github.com/NovaSky-AI/SkyRL/issues/1145
-
 SkyRL is a full-stack RL library that provides the following components:
 
 - [skyrl](./skyrl): Our new unified library for RL on your own hardware, with support for the [Tinker API](https://docs.skyrl.ai/docs/tinker/overview). `skyrl` combines our previous work:
@@ -35,6 +32,7 @@ For building environments, checkout [`skyrl-gym`](./skyrl-gym) to integrate your
 
 For agentic pipelines, check out [`skyrl-agent`](./skyrl-agent) for our work on optimizing and scaling pipelines for multi-turn tool use LLMs on long-horizon, real-environment tasks.
 
+For a list of supported models, see our [Supported Models](https://docs.skyrl.ai/docs/getting-started/supported_models) docs.
 
 # News
 - **[2026/02/17]** 🎉 SkyRL is officially integrated with Harbor! Train your terminal-use agent! [[Blog](https://novasky-ai.notion.site/skyrl-harbor)]
@@ -64,6 +62,7 @@ For agentic pipelines, check out [`skyrl-agent`](./skyrl-agent) for our work on 
 - [OpenThoughts-Agent](https://github.com/open-thoughts/OpenThoughts-Agent): Data recipes and robust infrastructure for training AI agents ![GitHub Repo stars](https://img.shields.io/github/stars/open-thoughts/OpenThoughts-Agent)
 - [Endless Terminals](https://arxiv.org/abs/2601.16443): A fully autonomous pipeline that procedurally generates terminal tasks for RL training with no human annotation needed ![GitHub Repo stars](https://img.shields.io/github/stars/kanishkg/endless-terminals)
 - [CodeScout](https://arxiv.org/abs/2603.17829): Open-source SoTA code localization on SWE-Bench via RL ![GitHub Repo stars](https://img.shields.io/github/stars/OpenHands/codescout)
+- [Reinforcing Recursive Language Models](https://www.alphaxiv.org/blog/reinforcement-learning-for-rlms): RL fine-tuning small models to behave as recursive language models
 
 # Acknowledgement
 

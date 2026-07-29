@@ -25,7 +25,7 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
   trainer.policy.model.path="Qwen/Qwen2.5-Coder-7B-Instruct" \
   trainer.epochs=30 \
   trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.policy.fsdp_config.cpu_offload=false \
   trainer.ref.fsdp_config.cpu_offload=true \
   trainer.policy.optimizer_config.max_grad_norm=0.5 \
@@ -49,7 +49,6 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
   generator.inference_engine.backend=vllm \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.weight_sync_backend=nccl \
-  generator.inference_engine.async_engine=true \
   generator.batched=false \
   environment.env_class=text2sql \
   generator.use_conversation_multi_turn=false \

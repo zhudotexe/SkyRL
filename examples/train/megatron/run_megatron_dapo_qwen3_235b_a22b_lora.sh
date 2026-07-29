@@ -117,7 +117,7 @@ uv run --isolated --extra megatron -m skyrl.train.entrypoints.main_base \
   trainer.policy.megatron_config.optimizer_config_kwargs.optimizer_offload_fraction=$OPTIMIZER_OFFLOAD_FRACTION \
   trainer.policy.megatron_config.transformer_config_kwargs.num_layers_in_last_pipeline_stage=$MEGATRON_LAST_PIPELINE_STAGE_LAYER \
   generator.inference_engine.engine_init_kwargs.max_model_len=$INFERENCE_ENGINE_MAX_MODEL_LEN \
-  trainer.use_sample_packing=true \
+  trainer.remove_microbatch_padding=true \
   trainer.flash_attn=$FLASH_ATTN \
   trainer.epochs=20 \
   trainer.eval_batch_size=1024 \
@@ -137,7 +137,6 @@ uv run --isolated --extra megatron -m skyrl.train.entrypoints.main_base \
   generator.inference_engine.backend=$INFERENCE_BACKEND \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.weight_sync_backend=nccl \
-  generator.inference_engine.async_engine=true \
   generator.batched=true \
   environment.env_class=aime \
   generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \

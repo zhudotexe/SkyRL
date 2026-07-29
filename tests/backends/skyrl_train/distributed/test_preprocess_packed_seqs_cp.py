@@ -46,19 +46,47 @@ _MEGATRON_MODULES = [
     "megatron.core.transformer",
     "megatron.core.transformer.module",
     "megatron.core.utils",
+    "megatron.core.transformer.moe",
+    "megatron.core.transformer.moe.moe_utils",
 ]
 
 _mock_modules: dict[str, ModuleType] = {}
 for _name in _MEGATRON_MODULES:
     _mock_modules[_name] = ModuleType(_name)
 
+# NOTE: overall this mocking is pretty brittle, we should just import guard in the source file
 _mock_modules["megatron.core"].parallel_state = _mock_modules["megatron.core.parallel_state"]
 _mock_modules["megatron.core.packed_seq_params"].PackedSeqParams = _PackedSeqParams
 _mock_modules["megatron.core.distributed"].DistributedDataParallel = MagicMock
 _mock_modules["megatron.core.optimizer"].ChainedOptimizer = MagicMock
 _mock_modules["megatron.core.transformer.module"].Float16Module = MagicMock
 _mock_modules["megatron.core.utils"].get_attr_wrapped_model = MagicMock()
-sys.modules.update(_mock_modules)
+_mock_modules["megatron.core.utils"].unwrap_model = MagicMock()
+_mock_modules["megatron.core.transformer.moe.moe_utils"].clear_aux_losses_tracker = MagicMock()
+_mock_modules["megatron.core.transformer.moe.moe_utils"].reduce_aux_losses_tracker_across_ranks = MagicMock()
+_mock_modules["megatron.core.transformer.moe.moe_utils"].get_moe_layer_wise_logging_tracker = MagicMock()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _stub_megatron_modules():
+    """Install the mock ``megatron`` modules for this module's tests only.
+
+    The stubs are injected into ``sys.modules`` at module setup and removed at
+    teardown so they do not leak into other test files in the same pytest
+    session. Only the megatron entries are touched: evicting everything this
+    module imported (e.g. ``vllm``) would force a re-import whose module-level
+    side effects are not idempotent.
+    """
+    saved = {_name: sys.modules.get(_name) for _name in _MEGATRON_MODULES}
+    sys.modules.update(_mock_modules)
+    try:
+        yield
+    finally:
+        for _name in _MEGATRON_MODULES:
+            if saved[_name] is None:
+                sys.modules.pop(_name, None)
+            else:
+                sys.modules[_name] = saved[_name]
 
 
 class TestPreprocessPackedSeqsShortSequencesCP:
@@ -102,8 +130,15 @@ class TestPreprocessPackedSeqsShortSequencesCP:
                 mock_mpu.get_context_parallel_world_size.return_value = cp_size
                 mock_mpu.get_context_parallel_rank.return_value = cp_rank
 
-                # This used to raise RuntimeError for short sequences
-                result_ids, packed_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=True)
+                # This used to raise RuntimeError for short sequences.
+                result_ids, packed_params = preprocess_packed_seqs(
+                    input_ids,
+                    attention_mask,
+                    pre_process=True,
+                    fp8_enabled=True,
+                )
 
                 assert result_ids.shape[0] == 1  # unsqueezed
+                assert result_ids.shape[1] % 16 == 0
+                assert packed_params.max_seqlen_q % (16 * cp_size) == 0
                 assert packed_params.qkv_format == "thd"

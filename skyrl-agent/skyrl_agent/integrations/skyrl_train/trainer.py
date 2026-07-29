@@ -26,7 +26,7 @@ from skyrl.train.generators.base import (
     BatchMetadata,
     TrainingPhase,
 )
-from skyrl.backends.skyrl_train.inference_engines.utils import get_sampling_params_for_backend
+from skyrl.backends.skyrl_train.inference_servers.engine_utils import get_sampling_params_for_backend
 from skyrl.train.dataset import PromptDataset
 
 from pathlib import Path
@@ -169,11 +169,10 @@ def build_dataloader(
         batch_size=batch_size if not is_fully_async else 1,
         shuffle=True if is_train else False,
         collate_fn=dataset.collate_fn,
-        # TODO(Charlie): debug why inference http endpoint is slow when num_workers is 8
-        num_workers=0 if cfg.generator.inference_engine.enable_http_endpoint else 8,
+        num_workers=8,
         drop_last=True if is_train else False,
         generator=seeded_generator,
-        multiprocessing_context="spawn" if not cfg.generator.inference_engine.enable_http_endpoint else None,
+        multiprocessing_context="spawn",
     )
     if is_train:
         if not is_fully_async:
@@ -286,24 +285,14 @@ class SkyRLAgentPPOTrainer(RayPPOTrainer):
         with Timer("init_weight_sync_state"):
             self.init_weight_sync_state()
 
-        # Load policy model to GPU before loading checkpoint.
-        if self.colocate_all:
-            self.policy_model.backload_to_gpu()
-
         # Load checkpoint state if resumption is enabled.
         if self.resume_mode != ResumeMode.NONE:
             with Timer("load_checkpoints"):
                 self.global_step, _ = self.load_checkpoints()
 
-        if self.colocate_all:
-            self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
-            await self.inference_engine_client.wake_up(tags=["weights"])
+        # Prepare weights for sampling
         with Timer("sync_weights"):
-            ray.get(self.sync_policy_weights_to_inference_engines())
-        if self.colocate_all:
-            with Timer("offload_policy_model_to_cpu"):
-                self.policy_model.offload_to_cpu(offload_optimizer=False, offload_model=True)
-            await self.inference_engine_client.wake_up(tags=["kv_cache"])
+            await self.dispatch.save_weights_for_sampler()
 
         # Eval before training
         if self.cfg.trainer.eval_interval > 0 and self.cfg.trainer.eval_before_train:
@@ -354,7 +343,7 @@ class SkyRLAgentPPOTrainer(RayPPOTrainer):
 
                     # 1.2 postprocess rewards
                     with Timer("postprocess_generator_output", self.all_timings):
-                        generator_output = self.postprocess_generator_output(generator_output, uids)
+                        generator_output, uids = self.postprocess_generator_output(generator_output, uids)
 
                     # 2. print example just for debugging
                     vis = self.tokenizer.decode(generator_output["response_ids"][0])
@@ -413,15 +402,8 @@ class SkyRLAgentPPOTrainer(RayPPOTrainer):
                             self.update_ref_with_policy()
 
                     # 7. sync weights to inference engines
-                    if self.colocate_all:
-                        self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
-                        await self.inference_engine_client.wake_up(tags=["weights"])
                     with Timer("sync_weights", self.all_timings):
-                        ray.get(self.sync_policy_weights_to_inference_engines())
-                    if self.colocate_all:
-                        with Timer("offload_policy_model_to_cpu"):
-                            self.policy_model.offload_to_cpu(offload_optimizer=False, offload_model=True)
-                        await self.inference_engine_client.wake_up(tags=["kv_cache"])
+                        await self.dispatch.save_weights_for_sampler()
 
                 # 8. set logs
                 logger.info(status)
@@ -453,7 +435,7 @@ class SkyRLAgentPPOTrainer(RayPPOTrainer):
         pbar.close()
         if self.colocate_all:
             await self.inference_engine_client.sleep()
-            self.policy_model.backload_to_gpu()
+
         if self.cfg.trainer.ckpt_interval > 0:
             with Timer("save_checkpoints", self.all_timings):
                 self.save_checkpoints()

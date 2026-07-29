@@ -1,11 +1,11 @@
 """Defines dispatch and collect logic for distributed training"""
 
-import asyncio
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Type
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Tuple, Type
 
 import ray
+import torch
 from ray import ObjectRef
 from ray.actor import ActorHandle
 
@@ -64,7 +64,6 @@ class Dispatch(ABC):
 
     Dispatch types are responsible for:
     - dispatching method calls to actors handling data sharding if necessary
-    - collecting results from actors and concatenating results if necessary
     - validating arguments for dispatch
     """
 
@@ -72,20 +71,6 @@ class Dispatch(ABC):
     @abstractmethod
     def dispatch(cls, actor_infos: List[ActorInfo], method: str, *args, **kwargs) -> List[ObjectRef]:
         """Dispatches method calls to the actors with data sharding if necessary."""
-        pass
-
-    @classmethod
-    @abstractmethod
-    async def async_collect(
-        cls, actor_infos: List[ActorInfo], object_refs: List[ObjectRef]
-    ) -> Optional[TrainingOutputBatch]:
-        """Collects results from the actors asynchronously in an asyncio-compatible way."""
-        pass
-
-    @classmethod
-    @abstractmethod
-    def sync_collect(cls, actor_infos: List[ActorInfo], object_refs: List[ObjectRef]) -> Optional[TrainingOutputBatch]:
-        """Collects results from the actors synchronously and returns a `TrainingOutputBatch`."""
         pass
 
     @classmethod
@@ -110,19 +95,10 @@ class MeshDispatch(Dispatch):
     * The input data is chunked into `dp_size` equal chunks, where `dp_size` is the size of data parallelism.
     * Each actor with the same DP rank processes the same data chunk in parallel.
 
-    For data collection:
-
-    * Data is collected only from the primary rank of each model/sequence parallel group.
-    * The primary rank is defined as the rank with (SP=0, TP=0, PP=0).
-    * The collected chunks are concatenated in order of DP rank to reconstruct the full data.
-
     Example: For a world size of 8, with DP size=2, SP size=2, TP size=2, PP size=1:
 
     * Data dispatch: The data is chunked into 2 chunks. All actors with DP rank 0 process the first chunk,
       and all actors with DP rank 1 process the second chunk.
-    * Data collection: Only two actors contribute to the final output - the primary rank from each DP group:
-      (DP=0, SP=0, TP=0, PP=0) and (DP=1, SP=0, TP=0, PP=0). Their chunks are concatenated in order.
-
     """
 
     @classmethod
@@ -145,26 +121,6 @@ class MeshDispatch(Dispatch):
             chunk_ref = chunk_refs[actor_info.rank.dp]
             object_refs.append(getattr(actor_info.handle, method).remote(chunk_ref, **kwargs))
         return object_refs
-
-    @classmethod
-    async def async_collect(
-        cls, actor_infos: List[ActorInfo], object_refs: List[ObjectRef]
-    ) -> Optional[TrainingOutputBatch]:
-        assert len(actor_infos) == len(object_refs), "`actor_infos` and `object_refs` must have the same length"
-        all_objects = await asyncio.gather(*object_refs)
-        if len(all_objects) and all_objects[0] is not None:
-            return concatenate_outputs_after_mesh_dispatch(actor_infos, all_objects)
-        return
-
-    @classmethod
-    def sync_collect(cls, actor_infos: List[ActorInfo], object_refs: List[ObjectRef]) -> Optional[TrainingOutputBatch]:
-        assert len(actor_infos) == len(object_refs), "`actor_infos` and `object_refs` must have the same length"
-        all_objects = ray.get(object_refs)
-        if len(all_objects) and all_objects[0] is not None:
-            return concatenate_outputs_after_mesh_dispatch(actor_infos, all_objects)
-        # all should be none
-        assert all(obj is None for obj in all_objects), "Got a mix of `None` and non-`None` objects"
-        return
 
     @classmethod
     def stage_chunks(
@@ -267,27 +223,6 @@ class PassThroughDispatch(Dispatch):
         return [getattr(actor_info.handle, method).remote(*args, **kwargs) for actor_info in actor_infos]
 
     @classmethod
-    async def async_collect(
-        cls, actor_infos: List[ActorInfo], object_refs: List[ObjectRef]
-    ) -> Optional[TrainingOutputBatch]:
-        all_objects = await asyncio.gather(*object_refs)
-        if len(all_objects) and all_objects[0] is not None:
-            return concatenate_outputs_after_mesh_dispatch(actor_infos, all_objects)
-        return
-
-    @classmethod
-    def sync_collect(cls, actor_infos: List[ActorInfo], object_refs: List[ObjectRef]) -> Optional[TrainingOutputBatch]:
-        data_batches = ray.get(object_refs)
-        if len(data_batches) > 0 and data_batches[0] is not None:
-            assert isinstance(
-                data_batches[0], TrainingOutputBatch
-            ), "data_batches must be a list of `TrainingOutputBatch` objects"
-            return concatenate_outputs_after_mesh_dispatch(actor_infos, data_batches)
-        # all should be none
-        assert all(obj is None for obj in data_batches), "Got a mix of `None` and non-`None` objects"
-        return
-
-    @classmethod
     def validate_dispatch_args(cls, *args, **kwargs) -> Tuple[Tuple, Dict[str, Any]]:
         # no validation needed just pass everything
         return args, kwargs
@@ -338,3 +273,78 @@ def concatenate_outputs_after_mesh_dispatch(
     for i in range(actor_infos[0].rank.dp_size):
         shards.append(dp_rank_to_shard[i])
     return TrainingOutputBatch.cat(shards)
+
+
+@dataclass(frozen=True)
+class WorkerOutput:
+    """Unified worker output for ``forward`` and ``forward_backward``.
+
+    All worker-side outputs (RL / SFT, inference / loss-with-backward) flow
+    through this dataclass at the dispatch boundary so callers can program
+    against a uniform API.
+
+    Attributes:
+        loss_fn_output_type: Tag describing the schema of each entry in
+            ``loss_fn_outputs`` (e.g. ``"scalar"`` for per-token scalar arrays).
+        loss_fn_outputs: Per-sample list of dicts. Each entry contains keys
+            specific to the worker role (e.g. ``logprobs`` for policy/ref,
+            ``values`` for critic, plus optional ``elementwise_loss`` on the
+            SFT path).
+        metrics: Scalar metrics (loss, lr, response_length, ...). Already
+            all-reduced across DP ranks by the worker.
+    """
+
+    loss_fn_output_type: str = "scalar"
+    loss_fn_outputs: List[Dict[str, Any]] = field(default_factory=list)
+    metrics: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def cat(cls, actor_infos: List[ActorInfo], shards: List["WorkerOutput"]) -> "WorkerOutput":
+        """Concatenate per-DP-rank shards in DP-rank order.
+
+        Only collects from collection DP ranks (matches
+        :meth:`MeshRank.is_collection_dp_rank`). ``loss_fn_outputs`` are
+        concatenated; ``metrics`` are taken from the first DP shard (they are
+        already all-reduced across DP within the worker).
+        """
+        assert len(actor_infos) == len(shards), "`actor_infos` and `shards` must have the same length"
+        dp_rank_to_shard: Dict[int, "WorkerOutput"] = {}
+        for ai, s in zip(actor_infos, shards):
+            if ai.rank.is_collection_dp_rank():
+                dp_rank_to_shard[ai.rank.dp] = s
+        if not dp_rank_to_shard:
+            # Unreachable in practice: any actor group has at least one collection
+            # DP rank. Default ``loss_fn_output_type="scalar"`` is fine here.
+            return cls()
+        ordered = [dp_rank_to_shard[i] for i in range(actor_infos[0].rank.dp_size)]
+        return cls(
+            loss_fn_output_type=ordered[0].loss_fn_output_type,
+            loss_fn_outputs=[x for s in ordered for x in s.loss_fn_outputs],
+            # metrics are already all-reduced across DP within each worker, so
+            # taking rank 0's dict (rather than re-aggregating) is correct.
+            metrics=dict(ordered[0].metrics),
+        )
+
+
+def loss_fn_outputs_to_tensor(
+    outputs: List[Dict[str, Any]],
+    key: str = "logprobs",
+    pad_value: float = 0.0,
+    dtype=torch.float32,
+    device=None,
+) -> torch.Tensor:
+    """Re-stack per-sample loss_fn_outputs into a right-padded ``[B, T_max]`` tensor.
+
+    Args:
+        outputs: Per-sample list of dicts (as in :attr:`WorkerOutput.loss_fn_outputs`).
+        key: Field to extract from each dict (e.g. ``"logprobs"`` for policy/ref,
+            ``"values"`` for critic).
+        pad_value: Padding value for right-padding shorter sequences.
+        dtype: Target dtype for the output tensor.
+        device: Optional target device.
+
+    Returns:
+        ``torch.Tensor[B, T_max]`` right-padded with ``pad_value``.
+    """
+    seqs = [torch.tensor(o[key], dtype=dtype, device=device) for o in outputs]
+    return torch.nn.utils.rnn.pad_sequence(seqs, batch_first=True, padding_value=pad_value)

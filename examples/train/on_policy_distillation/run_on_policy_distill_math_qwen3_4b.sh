@@ -34,7 +34,7 @@ TRAIN_BATCH_SIZE=512
 MINI_BATCH_SIZE=512
 N_SAMPLES_PER_PROMPT=16
 EVAL_N_SAMPLES_PER_PROMPT=32
-ENFORCE_EAGER=true
+ENFORCE_EAGER=false
 LR=1e-5
 
 uv run --isolated --extra fsdp -m examples.train.on_policy_distillation.main_on_policy_distill \
@@ -45,7 +45,7 @@ uv run --isolated --extra fsdp -m examples.train.on_policy_distillation.main_on_
   trainer.policy.model.path=$STUDENT_MODEL \
   trainer.ref.model.path=$TEACHER_MODEL \
   trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS_PER_NODE \
   trainer.placement.ref_num_gpus_per_node=$NUM_GPUS_PER_NODE \
   generator.inference_engine.num_engines=$NUM_INFERENCE_ENGINES \
@@ -76,7 +76,6 @@ uv run --isolated --extra fsdp -m examples.train.on_policy_distillation.main_on_
   trainer.algorithm.use_kl_in_reward=$USE_KL_IN_REWARD \
   generator.inference_engine.backend=vllm \
   generator.inference_engine.run_engines_locally=true \
-  generator.inference_engine.async_engine=false \
   generator.batched=true \
   environment.env_class=aime \
   generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \

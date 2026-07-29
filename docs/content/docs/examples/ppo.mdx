@@ -33,7 +33,7 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
    trainer.critic.model.path="Qwen/Qwen2.5-1.5B-Instruct" \
 
    # Model placement and training strategy (colocate or disaggregate, sharding, etc.)
-   trainer.strategy=fsdp2 \
+   trainer.strategy=fsdp \
    trainer.placement.colocate_all=true \
    trainer.placement.policy_num_gpus_per_node=4 \
    trainer.placement.critic_num_gpus_per_node=4 \
@@ -97,4 +97,4 @@ Congratulations! You've just launched your first PPO training run!
 Now that you've got basic colocated PPO training down, you might want to explore some more advanced features:
 
 - [Async Training](../tutorials/one_step_off_async): Asynchronous off-by-one training in < 100 lines of code!
-- [Remote Inference Engine](../examples/remote_server): Training with a remote inference engine
+- [Remote Inference Server](../examples/remote_server): Training with a remote inference engine

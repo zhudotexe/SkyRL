@@ -2,48 +2,39 @@ import asyncio
 import copy
 import importlib
 import os
-import subprocess
 import time
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
 
 import ray
 import requests
 import torch
 from loguru import logger
 from ray.util.placement_group import placement_group
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import AutoTokenizer
 
 from skyrl.backends.skyrl_train.distributed.dispatch import (
-    concatenate_outputs_after_mesh_dispatch,
+    WorkerOutput,
+    loss_fn_outputs_to_tensor,
 )
-from skyrl.backends.skyrl_train.inference_engines.base import InferenceEngineInput
-from skyrl.backends.skyrl_train.inference_engines.inference_engine_client import (
-    InferenceEngineClient,
-)
-from skyrl.backends.skyrl_train.inference_engines.ray_wrapped_inference_engine import (
-    create_ray_wrapped_inference_engines,
-)
-from skyrl.backends.skyrl_train.inference_engines.remote_inference_engine import (
-    create_remote_inference_engines,
-)
+from skyrl.backends.skyrl_train.inference_servers.base import InferenceEngineInput
 from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
     RemoteInferenceClient,
 )
 from skyrl.backends.skyrl_train.inference_servers.server_group import ServerGroup
 from skyrl.backends.skyrl_train.inference_servers.setup import create_inference_servers
 from skyrl.backends.skyrl_train.inference_servers.utils import (
+    _uses_lora_weight_sync,
     build_vllm_cli_args,
 )
 from skyrl.backends.skyrl_train.inference_servers.vllm_router import VLLMRouter
 from skyrl.backends.skyrl_train.training_batch import (
     TensorBatch,
     TrainingInputBatch,
-    TrainingOutputBatch,
 )
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
-from skyrl.env_vars import _SKYRL_USE_NEW_INFERENCE, SKYRL_PYTHONPATH_EXPORT
+from skyrl.env_vars import SKYRL_PYTHONPATH_EXPORT
 from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.dataset import PromptDataset
 from skyrl.train.dataset.replay_buffer import Experience
@@ -145,7 +136,7 @@ def make_dummy_experience(seq_len=10, num_actions=4) -> Experience:
 
 
 def import_worker(strategy: str, worker_type: str):
-    if strategy in ("fsdp", "fsdp2"):
+    if strategy == "fsdp":
         module_path = "skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker"
     elif strategy == "megatron":
         module_path = "skyrl.backends.skyrl_train.workers.megatron.megatron_worker"
@@ -157,20 +148,28 @@ def import_worker(strategy: str, worker_type: str):
 
 
 def init_worker_with_type(
-    worker_type: str, shared_pg=None, colocate_all=False, num_gpus_per_node=1, num_nodes=1, cfg=None
+    worker_type: str,
+    shared_pg=None,
+    colocate_all=False,
+    num_gpus_per_node=1,
+    num_nodes=1,
+    cfg=None,
+    num_gpus_per_actor=None,
 ) -> PPORayActorGroup:
     if cfg is None:
         cfg = get_test_actor_config()
 
     if shared_pg is not None:
         pg = ResolvedPlacementGroup(shared_pg)
-        num_gpus_per_actor = 0.2
+        if num_gpus_per_actor is None:
+            num_gpus_per_actor = 0.2
     else:
         bundles = [{"GPU": num_gpus_per_node, "CPU": num_gpus_per_node} for _ in range(num_nodes)]
         raw_pg = placement_group(bundles, strategy="PACK")
         get_ray_pg_ready_with_timeout(raw_pg, timeout=30)
         pg = ResolvedPlacementGroup(raw_pg)
-        num_gpus_per_actor = 0.75
+        if num_gpus_per_actor is None:
+            num_gpus_per_actor = 0.75
 
     worker_cls = import_worker(cfg.trainer.strategy, worker_type)
     model = PPORayActorGroup(
@@ -369,8 +368,8 @@ def get_model_logits_from_actor(actor_group: PPORayActorGroup, input_sequences, 
 
     results_refs = actor_group.async_run_ray_method("mesh", "forward", data)
     results = ray.get(results_refs)
-    ret_databatch: TrainingOutputBatch = concatenate_outputs_after_mesh_dispatch(actor_group.actor_infos, results)
-    logits = ret_databatch["output"]
+    output = WorkerOutput.cat(actor_group.actor_infos, results)
+    logits = loss_fn_outputs_to_tensor(output.loss_fn_outputs, key="logprobs")
 
     return logits
 
@@ -393,12 +392,10 @@ def ray_init_for_tests():
     env_vars["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
     env_vars["NVTE_FUSED_ATTN"] = "0"
     env_vars["LD_LIBRARY_PATH"] = os.environ.get("LD_LIBRARY_PATH")
-    if _SKYRL_USE_NEW_INFERENCE:
-        env_vars["_SKYRL_USE_NEW_INFERENCE"] = "1"
     ray.init(runtime_env={"env_vars": env_vars})
 
 
-async def run_inference(client, prompts, sampling_params, tokenizer=None):
+async def run_inference(client, prompts, sampling_params, tokenizer=None, model=None):
     engine_input = InferenceEngineInput(prompts=prompts, sampling_params=sampling_params)
     if isinstance(client, RemoteInferenceClient):
         # convert to prompt token ids for RemoteInferenceClient
@@ -414,14 +411,14 @@ async def run_inference(client, prompts, sampling_params, tokenizer=None):
             return_dict=False,
         )
         engine_input = InferenceEngineInput(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params)
-    return await client.generate(engine_input)
+    return await client.generate(engine_input, model=model)
 
 
 @dataclass
 class InferenceEngineState:
     """Manages inference engine lifecycle with clean resource cleanup."""
 
-    client: Union[InferenceEngineClient, RemoteInferenceClient]
+    client: RemoteInferenceClient
     pg: Optional[Any]  # placement group
     router: Optional[VLLMRouter]
     server_groups: Optional[List[ServerGroup]] = None
@@ -435,15 +432,16 @@ class InferenceEngineState:
         self._cleanup_pg = False
 
     def _close_common(self):
-        """Shutdown router, server_group, and Ray actors (sync resources).
-
-        For local engines (InferenceEngineClient wrapping RayWrappedInferenceEngines),
-        kills the underlying Ray actors so their torch.distributed TCPStore sockets
-        are released promptly, preventing port conflicts between tests.
-        """
+        """Shutdown router and server groups (sync resources)."""
         if self.router is not None:
             self.router.shutdown()
-        for group_list in (self.server_groups, self.prefill_server_groups, self.decode_server_groups):
+        # Handle shutdown for prefill and decode server groups separately
+        group_lists = (
+            [self.server_groups]
+            if not self.prefill_server_groups
+            else [self.prefill_server_groups, self.decode_server_groups]
+        )
+        for group_list in group_lists:
             if group_list is not None:
                 for group in group_list:
                     group.shutdown()
@@ -459,23 +457,15 @@ class InferenceEngineState:
                         except Exception as e:
                             logger.info(f"Encountered error at pg cleanup: {e}")
 
-        if isinstance(self.client, InferenceEngineClient):
-            for engine in self.client.engines:
-                if hasattr(engine, "inference_engine_actor"):
-                    ray.kill(engine.inference_engine_actor)
-            self.client.engines.clear()
-
     def close(self):
         """Sync close. Use from sync tests, fixtures, and finally blocks."""
         self._close_common()
-        if isinstance(self.client, RemoteInferenceClient):
-            asyncio.run(self.client.aclose())
+        asyncio.run(self.client.aclose())
 
     async def aclose(self):
         """Async close. Use from async tests and finally blocks."""
         self._close_common()
-        if isinstance(self.client, RemoteInferenceClient):
-            await self.client.aclose()
+        await self.client.aclose()
 
     def __enter__(self):
         return self
@@ -501,7 +491,6 @@ class InferenceEngineState:
         # optional overrides
         model: Optional[str] = None,
         use_local: Optional[bool] = None,
-        async_engine: Optional[bool] = None,
         tp_size: Optional[int] = None,
         colocate_all: Optional[bool] = None,
         backend: Optional[str] = None,
@@ -509,19 +498,18 @@ class InferenceEngineState:
         num_inference_engines: Optional[int] = None,
         sleep_level: int = 2,  # use level 1 in unit tests that do not explicitly sync weights or for LoRA
         enable_lora: bool = False,
-        active_lora_name: Optional[str] = None,
+        lora_max_loras: Optional[int] = None,
+        lora_max_cpu_loras: Optional[int] = None,
         max_num_seqs: Optional[int] = None,
         engine_init_kwargs: Optional[Dict[str, Any]] = None,
-        use_new_inference_servers: Optional[bool] = None,
         distributed_executor_backend: Optional[str] = None,
         expert_parallel_size: Optional[int] = None,
         enable_pd: bool = False,
         num_prefill: int = 0,
+        language_model_only: Optional[bool] = None,
     ) -> "InferenceEngineState":
         """
-        Instantiates inference engines in SkyRL with the provided configuration and overrides
-
-        if `use_new_inference_servers` is not None, it will be used in favour of the `_SKYRL_USE_NEW_INFERENCE` environment variable.
+        Instantiates inference engines in SkyRL with the provided configuration and overrides.
         """
         # create a cfg copy and apply overrides
         cfg = copy.deepcopy(cfg)
@@ -532,8 +520,6 @@ class InferenceEngineState:
             ie_cfg.backend = backend
         if use_local is not None:
             ie_cfg.run_engines_locally = use_local
-        if async_engine is not None:
-            ie_cfg.async_engine = async_engine
         if tp_size is not None:
             ie_cfg.tensor_parallel_size = tp_size
         if colocate_all is not None:
@@ -553,6 +539,15 @@ class InferenceEngineState:
         if enable_pd:
             ie_cfg.enable_pd = True
             ie_cfg.num_prefill = num_prefill
+        # Propagate the LoRA limits onto the trainer config so build_vllm_cli_args
+        # (which reads from cfg.trainer.policy.model.lora) and any downstream
+        # path picks them up before vLLM is started.
+        if lora_max_loras is not None:
+            cfg.trainer.policy.model.lora.max_loras = lora_max_loras
+        if lora_max_cpu_loras is not None:
+            cfg.trainer.policy.model.lora.max_cpu_loras = lora_max_cpu_loras
+        if language_model_only is not None:
+            ie_cfg.language_model_only = language_model_only
 
         assert ie_cfg.run_engines_locally, "This test does not yet support remote engines."
 
@@ -569,94 +564,50 @@ class InferenceEngineState:
             )
             get_ray_pg_ready_with_timeout(raw_pg, timeout=60)
             shared_pg = ResolvedPlacementGroup(raw_pg)
-            sleep = True
         else:
-            shared_pg, sleep = None, False
+            shared_pg = None
 
         # Extract served_model_name from config if set
         served_model_name = ie_cfg.served_model_name
 
-        tokenizer = get_tokenizer(cfg.trainer.policy.model.path)
+        # The inference servers are up by default, so there is no special sleep handling.
+        cli_args = build_vllm_cli_args(cfg)
+        if enable_lora:
+            cli_args.enable_lora = True
 
-        # Return both router and server group if created to keep references alive
-        router = None
-        needs_wake_up = False
-        server_groups = None
-        prefill_server_groups = None
-        decode_server_groups = None
-        if use_new_inference_servers or (use_new_inference_servers is None and _SKYRL_USE_NEW_INFERENCE):
-            # NOTE: In the case of the new inference backend, server is up by default, so we don't need
-            # any special handling for sleep
-            cli_args = build_vllm_cli_args(cfg)
-            if enable_lora:
-                cli_args.enable_lora = True
-                if active_lora_name is None:
-                    active_lora_name = "skyrl-lora"
+        setup = create_inference_servers(
+            ie_cfg,
+            cli_args,
+            log_path=cfg.trainer.log_path,
+            placement_group=shared_pg if cfg.trainer.placement.colocate_all else None,
+        )
+        router = setup.router
+        server_groups = setup.server_groups
+        prefill_server_groups = setup.prefill_server_groups
+        decode_server_groups = setup.decode_server_groups
+        proxy_url = setup.proxy_url
+        server_urls = setup.server_urls
 
-            setup = create_inference_servers(
-                ie_cfg,
-                cli_args,
-                log_path=cfg.trainer.log_path,
-                placement_group=shared_pg if cfg.trainer.placement.colocate_all else None,
-            )
-            router = setup.router
-            server_groups = setup.server_groups
-            prefill_server_groups = setup.prefill_server_groups
-            decode_server_groups = setup.decode_server_groups
-            proxy_url = setup.proxy_url
-            server_urls = setup.server_urls
+        # When LoRA is enabled, point the client's default ``model_name`` at
+        # the active LoRA adapter so existing tests that don't pass an
+        # explicit ``model=`` keep routing through the adapter. Tests that
+        # need multi-LoRA can pass ``model=`` per call and rely on the
+        # client's underlying base model name only when needed.
+        # ``model_name`` is the base model the server was started with;
+        # LoRA-aware test cases are expected to pass adapter names
+        # explicitly per call (e.g. ``client.generate(..., model="lora-X")``).
+        base_model_name = served_model_name if served_model_name else cfg.trainer.policy.model.path
 
-            client = RemoteInferenceClient(
-                proxy_url=proxy_url,
-                server_urls=server_urls,
-                model_name=served_model_name if served_model_name else cfg.trainer.policy.model.path,
-                enable_return_routed_experts=ie_cfg.enable_return_routed_experts,
-                active_lora_name=active_lora_name,
-                data_parallel_size=ie_cfg.data_parallel_size,
-                tokenizer=get_tokenizer(cfg.trainer.policy.model.path),
-            )
-        else:
-            eps = create_ray_wrapped_inference_engines(
-                num_inference_engines=ie_cfg.num_engines,
-                tensor_parallel_size=ie_cfg.tensor_parallel_size,
-                expert_parallel_size=ie_cfg.expert_parallel_size,
-                model_dtype="bfloat16",
-                pretrain=cfg.trainer.policy.model.path,
-                seed=42,
-                vllm_v1_disable_multiproc=True,
-                data_parallel_size=ie_cfg.data_parallel_size,
-                enable_prefix_caching=ie_cfg.enable_prefix_caching,
-                enforce_eager=ie_cfg.enforce_eager,
-                shared_pg=shared_pg,
-                gpu_memory_utilization=ie_cfg.gpu_memory_utilization,
-                inference_engine_enable_sleep=sleep,
-                async_engine=ie_cfg.async_engine,
-                max_num_batched_tokens=8192,
-                max_num_seqs=ie_cfg.max_num_seqs,
-                tokenizer=tokenizer,
-                backend=ie_cfg.backend,
-                sleep_level=sleep_level,
-                enable_lora=enable_lora,
-                engine_init_kwargs=ie_cfg.engine_init_kwargs,
-                enable_return_routed_experts=ie_cfg.enable_return_routed_experts,
-                served_model_name=served_model_name,
-                distributed_executor_backend=ie_cfg.distributed_executor_backend,
-            )
-            client = InferenceEngineClient(
-                eps, tokenizer, cfg.trainer.policy.model.path, cfg.trainer.policy.model.lora, ie_cfg
-            )
-            if sleep:
-                # NOTE: this is a hacky fix to allow creation from both sync and async contexts
-                # TODO: simplify this when old inference path is removed and unify on async context
-                try:
-                    asyncio.get_running_loop()
-                    # Inside an async context (e.g. pytest-asyncio) - defer wake_up to __aenter__
-                    needs_wake_up = True
-                except RuntimeError:
-                    asyncio.run(client.wake_up())
-                    needs_wake_up = False
-            else:
-                needs_wake_up = False
+        client = RemoteInferenceClient(
+            proxy_url=proxy_url,
+            server_urls=server_urls,
+            model_name=base_model_name,
+            enable_return_routed_experts=ie_cfg.enable_return_routed_experts,
+            uses_lora_weight_sync=_uses_lora_weight_sync(cfg),
+            data_parallel_size=ie_cfg.data_parallel_size,
+            tokenizer=get_tokenizer(cfg.trainer.policy.model.path),
+        )
+
         state = cls(
             client=client,
             pg=raw_pg if shared_pg else None,
@@ -665,102 +616,6 @@ class InferenceEngineState:
             prefill_server_groups=prefill_server_groups,
             decode_server_groups=decode_server_groups,
         )
-        state._needs_wake_up = needs_wake_up
+        state._needs_wake_up = False
         state._cleanup_pg = not shared_pg
         return state
-
-
-def init_remote_inference_servers(
-    tp_size: int,
-    backend: str,
-    tokenizer: PreTrainedTokenizerBase,
-    config: SkyRLTrainConfig,
-    model: str,
-) -> Tuple[InferenceEngineClient, subprocess.Popen]:
-    available_gpus = get_available_gpus()
-    assert (
-        len(available_gpus) >= tp_size
-    ), f"Not enough GPUs available. Need {tp_size}, but only {len(available_gpus)} available: {available_gpus}"
-
-    selected_gpus = available_gpus[:tp_size]
-    gpu_ids_str = ",".join(map(str, selected_gpus))
-    print(f"Using GPUs {gpu_ids_str} for vLLM server (tensor_parallel_size={tp_size})")
-
-    def get_free_port():
-        import socket
-
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(("", 0))
-        port = s.getsockname()[1]
-        s.close()
-        return port
-
-    engine_port = get_free_port()
-
-    # Launch vLLM server using subprocess
-    if backend == "vllm":
-        remote_server_command = [
-            "uv",
-            "run",
-            "--isolated",
-            "--extra",
-            "fsdp",
-            "-m",
-            "skyrl.backends.skyrl_train.inference_engines.vllm.vllm_server",
-            "--model",
-            model,
-            "--enforce-eager",
-            "--gpu-memory-utilization",
-            "0.8",
-            "--tensor-parallel-size",
-            str(tp_size),
-            # TODO (erictang000): for 0.13+ vllm, the MP backend runs into issues with CUDA_VISIBLE_DEVICES
-            # when we refactor the inference backend to use remote inference engines as a default, revisit this
-            "--distributed-executor-backend",
-            "ray",
-            "--dtype",
-            "bfloat16",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(engine_port),
-            "--worker-extension-cls",
-            "skyrl.backends.skyrl_train.inference_engines.vllm.vllm_engine.WorkerWrap",
-        ]
-    else:
-        raise ValueError(f"Unsupported backend: {backend}")
-
-    # Set CUDA_VISIBLE_DEVICES environment variable for the subprocess
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = gpu_ids_str
-
-    # Start the vLLM server process
-    server_process = subprocess.Popen(remote_server_command, env=env)
-    try:
-        wait_for_server(url=f"localhost:{engine_port}", health_path="health", timeout=400)
-    except TimeoutError as e:
-        print(f"Received timeout error while waiting for server: {e}")
-        server_process.terminate()
-        server_process.wait()
-        raise
-
-    print(f"Server at localhost:{engine_port} is online")
-
-    engines = create_remote_inference_engines(
-        urls=[f"localhost:{engine_port}"],
-        model_name=model,
-        tokenizer=tokenizer,
-        engine_backend=backend,
-        tensor_parallel_size=tp_size,
-        data_parallel_size=1,
-        expert_parallel_size=1,
-    )
-
-    client = InferenceEngineClient(
-        engines,
-        tokenizer,
-        config.trainer.policy.model.path,
-        config.trainer.policy.model.lora,
-        config.generator.inference_engine,
-    )
-    return client, server_process
