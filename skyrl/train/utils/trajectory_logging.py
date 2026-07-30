@@ -156,7 +156,14 @@ class TrajectoryLogger:
         know how to write to.
         """
         response_ids = generator_output.get("response_ids") or []
-        if num_samples <= 0 or tracker is None or tracker.backend != "wandb" or not response_ids:
+        # Backends that can render a sample table (see Tracking.log_samples_to_table):
+        # wandb (wandb.Table) and mlflow (mlflow.log_table). Others are a no-op.
+        if (
+            num_samples <= 0
+            or tracker is None
+            or tracker.backend not in ("wandb", "mlflow")
+            or not response_ids
+        ):
             return
         loss_masks = generator_output.get("loss_masks") or []
         rewards = generator_output.get("rewards") or []

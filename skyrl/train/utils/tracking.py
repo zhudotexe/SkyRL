@@ -149,9 +149,26 @@ class Tracking:
         consistent across calls for the same ``key``; each row in ``samples``
         must have ``len(columns)`` values in the matching order.
 
-        No-op for non-wandb backends -- only the wandb backend supports
-        ``wandb.Table``.
+        No-op for backends that can't render a sample table. The wandb backend
+        uses ``wandb.Table``; the mlflow backend uses ``mlflow.log_table`` (rows
+        land in an ``<key>.json`` artifact, rendered as a table in the MLflow UI
+        and appended across steps since mlflow re-reads the existing artifact).
         """
+        if self.backend == "mlflow":
+            # mlflow.log_table wants a columnar dict {col: [values...]}. `samples`
+            # is a list of row tuples aligned to `columns`; transpose them. Logging
+            # to the same artifact_file across calls makes mlflow read-append, so
+            # the table accumulates the same way the wandb table does.
+            import mlflow
+
+            artifact_file = f"{key.replace('/', '_')}.json"
+            data = {col: [row[i] for row in samples] for i, col in enumerate(columns)}
+            try:
+                mlflow.log_table(data=data, artifact_file=artifact_file)
+            except Exception as e:  # non-fatal: sample logging must never kill training
+                logger.warning(f"mlflow.log_table failed for {artifact_file!r}: {e}")
+            return
+
         if self.backend != "wandb":
             return
         import wandb
