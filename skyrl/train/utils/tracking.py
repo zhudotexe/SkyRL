@@ -150,18 +150,28 @@ class Tracking:
         must have ``len(columns)`` values in the matching order.
 
         No-op for backends that can't render a sample table. The wandb backend
-        uses ``wandb.Table``; the mlflow backend uses ``mlflow.log_table`` (rows
-        land in an ``<key>.json`` artifact, rendered as a table in the MLflow UI
-        and appended across steps since mlflow re-reads the existing artifact).
+        uses ``wandb.Table``; the mlflow backend uses ``mlflow.log_table``.
+
+        For mlflow, each call writes a *step-scoped* artifact
+        (``<key>_step_<step>.json``) rather than a single accumulating
+        ``<key>.json``. Reusing one artifact_file makes ``mlflow.log_table``
+        read-append -- it re-downloads the whole existing table, concatenates,
+        and re-uploads -- so upload+download cost grows linearly with steps.
+        A fresh file per step is upload-only (small, constant per call). The
+        trade-off is that the MLflow UI shows one table artifact per step
+        instead of a single growing one; step ordering is preserved by
+        zero-padding the suffix so the artifact list sorts chronologically.
         """
         if self.backend == "mlflow":
             # mlflow.log_table wants a columnar dict {col: [values...]}. `samples`
-            # is a list of row tuples aligned to `columns`; transpose them. Logging
-            # to the same artifact_file across calls makes mlflow read-append, so
-            # the table accumulates the same way the wandb table does.
+            # is a list of row tuples aligned to `columns`; transpose them. Each
+            # step gets its own artifact_file so mlflow only uploads the new rows
+            # instead of re-reading + rewriting a single accumulating artifact.
             import mlflow
 
-            artifact_file = f"{key.replace('/', '_')}.json"
+            # Zero-pad the step so the artifact browser sorts step_2 before
+            # step_10 (lexicographic). 7 digits covers up to ~10M steps.
+            artifact_file = f"{key.replace('/', '_')}_step_{step:07d}.json"
             data = {col: [row[i] for row in samples] for i, col in enumerate(columns)}
             try:
                 mlflow.log_table(data=data, artifact_file=artifact_file)
