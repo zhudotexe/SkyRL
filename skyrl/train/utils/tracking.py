@@ -199,6 +199,23 @@ class Tracking:
         self.logger.log({key: new_table}, step=step)
         self._sample_tables[key] = new_table
 
+    def log_artifact(self, local_path: str, artifact_path: Optional[str] = None) -> None:
+        """Upload a local file as an artifact to the run's artifact store.
+
+        mlflow-only: wraps ``mlflow.log_artifact``, placing the file under
+        ``artifact_path`` (a directory within the run's artifacts). No-op for
+        every other backend. Failures are logged and swallowed — artifact
+        upload must never kill training.
+        """
+        if self.backend != "mlflow":
+            return
+        import mlflow
+
+        try:
+            mlflow.log_artifact(local_path, artifact_path=artifact_path)
+        except Exception as e:  # non-fatal: artifact logging must never kill training
+            logger.warning(f"mlflow.log_artifact failed for {local_path!r}: {e}")
+
     def __del__(self):
         try:
             self.finish()

@@ -75,7 +75,7 @@ def _maybe_redel_dump_subagent_trajectories(
     concat_generator_outputs: GeneratorOutput,
     tokenizer: AutoTokenizer,
     dump_dir_path: Path,
-) -> None:
+) -> Optional[Path]:
     """If ``generator`` is a ReDelGenerator, dump the per-rollout fork/join tree to
     ``subagent_trajectories.jsonl`` alongside the standard per-dataset eval dumps.
 
@@ -84,16 +84,19 @@ def _maybe_redel_dump_subagent_trajectories(
     only decodes the flat per-step response ids and can't tell root from subagent steps;
     this reconstructs, per eval sample (``instance_id``), the set of agents and each agent's
     steps. No-op for non-ReDel generators or if the key is absent.
+
+    Returns the path of the written ``.jsonl`` file, or ``None`` when nothing was written
+    (so the caller can optionally upload it as an mlflow artifact).
     """
     try:
         from redel_rl.redel_generator import ReDelGenerator
     except ImportError:
-        return
+        return None
     if not isinstance(generator, ReDelGenerator):
-        return
+        return None
     records = concat_generator_outputs.get("redel_step_records")
     if not records:
-        return
+        return None
     response_ids = concat_generator_outputs["response_ids"]
     # Authoritative per-step score: matches what dump_per_dataset_eval_results writes, and
     # reflects generator post-processing (zero_reward_on_non_stop / overlong filtering) that
@@ -165,6 +168,7 @@ def _maybe_redel_dump_subagent_trajectories(
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     logger.info(f"Dumped redel subagent trajectories ({len(by_rollout)} rollouts) to {filename}")
+    return filename
 
 
 @torch.no_grad()
@@ -458,7 +462,17 @@ async def evaluate_step_wise(
                 eval_metrics,
             )
             # additive ReDel-only dump of the fork/join tree; no-op for other generators
-            _maybe_redel_dump_subagent_trajectories(generator, concat_generator_outputs, tokenizer, data_save_dir)
+            subagent_dump_path = _maybe_redel_dump_subagent_trajectories(
+                generator, concat_generator_outputs, tokenizer, data_save_dir
+            )
+            # Also upload the fork/join tree to the tracker so it's viewable without
+            # pulling the export dir off the cluster. One step-scoped artifact dir per
+            # eval; zero-padded so the artifact browser sorts chronologically.
+            if subagent_dump_path is not None and tracker is not None:
+                step_tag = "eval_only" if global_step is None else f"global_step_{global_step:07d}"
+                tracker.log_artifact(
+                    str(subagent_dump_path), artifact_path=f"subagent_trajectories/{step_tag}"
+                )
 
     eval_metrics["timing/eval_generate"] = eval_generate_time
     return eval_metrics
