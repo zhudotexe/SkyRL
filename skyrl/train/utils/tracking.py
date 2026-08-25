@@ -161,18 +161,34 @@ class Tracking:
         trade-off is that the MLflow UI shows one table artifact per step
         instead of a single growing one; step ordering is preserved by
         zero-padding the suffix so the artifact list sorts chronologically.
+
+        On a *resumed* run the same eval step is re-logged. If that reused the
+        prior attempt's artifact name, ``log_table`` would download + JSON-parse
+        the existing artifact to append to it -- and that read crashes when the
+        killed attempt left the artifact truncated. Appending an epoch-seconds
+        suffix to the name sidesteps this: each write goes to a fresh artifact,
+        so ``log_table`` never re-reads a possibly-corrupt one (and no artifact
+        listing is needed). Step ordering still holds because the zero-padded
+        step sorts ahead of the suffix.
         """
         if self.backend == "mlflow":
             # mlflow.log_table wants a columnar dict {col: [values...]}. `samples`
             # is a list of row tuples aligned to `columns`; transpose them. Each
             # step gets its own artifact_file so mlflow only uploads the new rows
             # instead of re-reading + rewriting a single accumulating artifact.
+            import time
+
             import mlflow
 
-            # Zero-pad the step so the artifact browser sorts step_2 before
-            # step_10 (lexicographic). 7 digits covers up to ~10M steps.
-            artifact_file = f"{key.replace('/', '_')}_step_{step:07d}.json"
             data = {col: [row[i] for row in samples] for i, col in enumerate(columns)}
+            # Zero-pad the step so the artifact browser sorts step_2 before
+            # step_10 (lexicographic); 7 digits covers ~10M steps. The
+            # epoch-seconds suffix makes a resumed attempt (which re-logs the
+            # same step) write a *new* artifact rather than collide with the
+            # prior attempt's -- that collision is what sends log_table down its
+            # download+JSON-parse path, which crashes on an artifact the killed
+            # attempt left truncated. Keeps every write a clean, list-free upload.
+            artifact_file = f"{key.replace('/', '_')}_step_{step:07d}_{int(time.time())}.json"
             try:
                 mlflow.log_table(data=data, artifact_file=artifact_file)
             except Exception as e:  # non-fatal: sample logging must never kill training
