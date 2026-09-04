@@ -594,15 +594,19 @@ def handle_filter_sampling(
             f"Dynamic sampling: collected {collected_state['num_prompts_in_batch']} >= {target_batch_size} prompts"
         )
         logger.info("==================================================")
-        # Truncate to exact batch size if needed
-        n_samples_per_prompt = sampling_config.get("n_samples_per_prompt", 1)
-        max_trajectories = target_batch_size * n_samples_per_prompt
+        # Truncate to exactly `target_batch_size` prompt groups, keeping every row of each kept group.
+        # Rows are not 1:1 with prompts x n_samples_per_prompt: step-wise trajectories span several rows
+        # and multi-agent generators emit one row per agent, so truncating by row count would shear
+        # groups (and could drop the root a subagent's advantage is centered against).
         final_output = collected_state["collected_generator_output"]
         final_uids = collected_state["collected_uids"]
 
-        if len(final_uids) > max_trajectories:
-            final_output = filter_generator_output(final_output, list(range(max_trajectories)))
-            final_uids = final_uids[:max_trajectories]
+        kept_prompt_uids = list(dict.fromkeys(final_uids))[:target_batch_size]
+        if len(kept_prompt_uids) < len(set(final_uids)):
+            kept_set = set(kept_prompt_uids)
+            kept_indices = [i for i, uid in enumerate(final_uids) if uid in kept_set]
+            final_output = filter_generator_output(final_output, kept_indices)
+            final_uids = [final_uids[i] for i in kept_indices]
 
         return final_output, final_uids, False, None
 
