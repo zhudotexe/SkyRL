@@ -562,6 +562,16 @@ def handle_filter_sampling(
         if traj_uid in kept_uids_set:
             kept_traj_idxs.append(idx)
 
+    # An entire sampled batch can be uninformative — every group zero-variance — which happens for a
+    # single-agent run both early (nothing succeeds) and late (everything does). Contribute nothing and
+    # keep sampling: `filter_generator_output` rejects an empty index list.
+    if not kept_traj_idxs:
+        logger.info(
+            f"Dynamic sampling: batch {collected_state['sample_batch_count']} had no reward variance in "
+            "any group; contributing nothing and resampling..."
+        )
+        return generator_output, uids, True, collected_state
+
     # Apply filtering to generator output
     filtered_output = filter_generator_output(generator_output, kept_traj_idxs)
     filtered_uids = [uids[idx] for idx in kept_traj_idxs]
