@@ -297,7 +297,17 @@ class VLLMMetricsScraper:
         excluded from the throughput denominator.
         """
         if self._label is not None:
-            raise ValueError(f"`start({label!r})` called while window {self._label!r} is still open")
+            # A caller can leave a window open on any path that skips `stop()` — dynamic sampling's
+            # resample `continue` exhausting the epoch's dataloader mid-step is the one that bites. This
+            # is throughput telemetry, so a stale window must not kill a multi-day training run: discard
+            # it loudly and open the new one.
+            logger.warning(
+                f"`start({label!r})` called while window {self._label!r} was still open; discarding the "
+                "stale window (a previous step skipped `stop()`)."
+            )
+            self._label = None
+            self._active_since = None
+            self._paused = False
         self._window_prev = await self._read_snapshot()
         self._label = label
         self._window_time_s = 0.0
