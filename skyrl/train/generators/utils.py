@@ -219,11 +219,21 @@ def get_metrics_from_generator_output(generator_output: GeneratorOutput, uids: L
         for i, reward in enumerate(rewards):
             uid_to_trajectory_rewards[uids[i]].append(reward)
 
-    # For each trajectory, if the reward is positive, then it's a "pass". So for a single example, if
-    # any of its trajectories' reward is positive, pass@n for that uid is 1.
-    pass_at_n = sum(1 for v in uid_to_trajectory_rewards.values() if any(r > 0 for r in v)) / len(
-        uid_to_trajectory_rewards
-    )
+    # A uid passes if any of its trajectories is solved. Generators that know what "solved" means
+    # (ReDel's RewardOutput.is_max_correctness) say so per trajectory; otherwise fall back to
+    # reward > 0, which conflates partial credit and shaping terms with solving the task.
+    solved_flags = generator_output.get("is_max_correctness")
+    if solved_flags is not None:
+        if len(solved_flags) != len(uids):
+            raise ValueError(f"`is_max_correctness` has {len(solved_flags)} entries for {len(uids)} trajectories")
+        uid_to_solved = defaultdict(list)
+        for uid, solved in zip(uids, solved_flags):
+            uid_to_solved[uid].append(bool(solved))
+        pass_at_n = sum(1 for v in uid_to_solved.values() if any(v)) / len(uid_to_solved)
+    else:
+        pass_at_n = sum(1 for v in uid_to_trajectory_rewards.values() if any(r > 0 for r in v)) / len(
+            uid_to_trajectory_rewards
+        )
 
     return MetricsOutput(
         avg_score=mean_raw_reward,
@@ -290,6 +300,7 @@ def concatenate_generator_outputs(generator_outputs: List[GeneratorOutput], step
         "rewards": _flatten_field(generator_outputs, "rewards"),
         "loss_masks": _flatten_field(generator_outputs, "loss_masks"),
         "stop_reasons": _concat_optional_field(generator_outputs, "stop_reasons"),
+        "is_max_correctness": _concat_optional_field(generator_outputs, "is_max_correctness"),
         "rollout_logprobs": _concat_optional_field(generator_outputs, "rollout_logprobs"),
         "trajectory_generation_times": _concat_optional_field(generator_outputs, "trajectory_generation_times"),
         "trajectory_time_splits": _concat_optional_field(generator_outputs, "trajectory_time_splits"),

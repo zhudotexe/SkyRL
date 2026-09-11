@@ -36,6 +36,7 @@ def test_generator_output_concatenation():
         "trajectory_time_splits",
         "is_last_step",
         "env_metrics",
+        "is_max_correctness",
         "pixel_values",
         "image_grid_thw",
     ]
@@ -52,6 +53,7 @@ def test_generator_output_concatenation():
         "loss_masks": [[1, 1], [1, 1]],
         "stop_reasons": ["stop", "stop"],
         "rollout_logprobs": [[0.1, 0.2], [0.3, 0.4]],
+        "is_max_correctness": [True, False],
     }
 
     generator_output_2: GeneratorOutput = {
@@ -61,6 +63,7 @@ def test_generator_output_concatenation():
         "loss_masks": [[1, 1, 1], [1]],
         "stop_reasons": ["stop", "stop"],
         "rollout_logprobs": [[0.5, 0.6, 0.7], [0.8]],
+        "is_max_correctness": [False, True],
     }
 
     generator_outputs = [generator_output_1, generator_output_2]
@@ -72,6 +75,10 @@ def test_generator_output_concatenation():
     assert concatenated_output["loss_masks"] == [[1, 1], [1, 1], [1, 1, 1], [1]]
     assert concatenated_output["stop_reasons"] == ["stop", "stop", "stop", "stop"]
     assert concatenated_output["rollout_logprobs"] == [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6, 0.7], [0.8]]
+    assert concatenated_output["is_max_correctness"] == [True, False, False, True]
+    # an output without the flag makes the concatenated flag None (metrics then fall back to reward > 0)
+    generator_output_3 = {k: v for k, v in generator_output_2.items() if k != "is_max_correctness"}
+    assert concatenate_generator_outputs([generator_output_1, generator_output_3])["is_max_correctness"] is None
 
     # Validate rollout metrics
     expected_rollout_metrics = {
@@ -202,6 +209,43 @@ def test_get_metrics_from_generator_output():
     assert metrics["avg_score"] == 0.0
     assert metrics["pass_at_n"] == 0.5
     assert metrics["mean_positive_reward"] == 0.75
+
+
+def test_get_metrics_pass_at_n_uses_is_max_correctness_when_present():
+    # Partial credit + shaping make reward > 0 a poor "pass": a positive reward with the flag False must
+    # not count, a zero reward with the flag True must (the flag is authoritative when present).
+    generator_output: GeneratorOutput = {
+        "prompt_token_ids": [[1], [1], [2], [2], [3]],
+        "response_ids": [[1], [1], [2], [2], [3]],
+        "rewards": [0.5, 0.4, 0.0, 0.0, -0.1],
+        "loss_masks": [[1], [1], [1], [1], [1]],
+        "stop_reasons": ["stop"] * 5,
+        "rollout_logprobs": None,
+        "is_max_correctness": [False, False, True, False, False],
+    }
+    uids = ["a", "a", "b", "b", "c"]
+    metrics = get_metrics_from_generator_output(generator_output, uids)
+    assert metrics["pass_at_n"] == pytest.approx(1 / 3)
+    # avg_score / mean_positive_reward still come from the rewards
+    assert metrics["avg_score"] == pytest.approx(0.16)
+    assert metrics["mean_positive_reward"] == pytest.approx(0.18)
+
+    # per-token rewards use the same flags
+    generator_output["rewards"] = [[0.0, 0.5], [0.0, 0.4], [0.0, 0.0], [0.0, 0.0], [0.0, -0.1]]
+    metrics = get_metrics_from_generator_output(generator_output, uids)
+    assert metrics["pass_at_n"] == pytest.approx(1 / 3)
+
+    # absent (None) or missing flags -> legacy reward > 0 behaviour
+    generator_output["is_max_correctness"] = None
+    metrics = get_metrics_from_generator_output(generator_output, uids)
+    assert metrics["pass_at_n"] == pytest.approx(1 / 3)  # only uid "a" has reward > 0
+    del generator_output["is_max_correctness"]
+    assert get_metrics_from_generator_output(generator_output, uids)["pass_at_n"] == pytest.approx(1 / 3)
+
+    # a misaligned flag list is a bug, not something to average over
+    generator_output["is_max_correctness"] = [True]
+    with pytest.raises(ValueError):
+        get_metrics_from_generator_output(generator_output, uids)
 
 
 # ───────────────────────────────────────────────────────────────────

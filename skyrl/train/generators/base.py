@@ -57,6 +57,9 @@ class GeneratorOutput(TypedDict):
     # ``dump_per_dataset_eval_results`` to surface env-specific info (e.g. RLM's
     # ``rlm_metadata``) in eval JSONL dumps.
     env_metrics: Optional[List[Dict[str, Any]]]
+    # per-trajectory "solved" flag; when present, get_metrics_from_generator_output computes pass@n
+    # from it instead of reward > 0
+    is_max_correctness: Optional[List[bool]]
     # Applicable only for vision-language models
     pixel_values: Optional[List[torch.Tensor]]
     image_grid_thw: Optional[List[torch.Tensor]]
