@@ -178,8 +178,6 @@ class Tracking:
             # instead of re-reading + rewriting a single accumulating artifact.
             import time
 
-            import mlflow
-
             data = {col: [row[i] for row in samples] for i, col in enumerate(columns)}
             # Zero-pad the step so the artifact browser sorts step_2 before
             # step_10 (lexicographic); 7 digits covers ~10M steps. The
@@ -190,9 +188,15 @@ class Tracking:
             # attempt left truncated. Keeps every write a clean, list-free upload.
             artifact_file = f"{key.replace('/', '_')}_step_{step:07d}_{int(time.time())}.json"
             try:
-                mlflow.log_table(data=data, artifact_file=artifact_file)
+                # Target the owned run_id via the client, NOT the fluent `mlflow.log_table`. The
+                # fluent active-run stack is thread-LOCAL, and the fully-async trainer runs this
+                # logging under `asyncio.to_thread` (a worker thread with no active run), so a
+                # fluent call there would auto-start a fresh random-named run and leak the table
+                # into it (plus a system-metrics monitor stuck RUNNING forever). Explicit run_id
+                # is thread-safe and keeps the table on the real run.
+                self.logger.client.log_table(self.logger.run_id, data=data, artifact_file=artifact_file)
             except Exception as e:  # non-fatal: sample logging must never kill training
-                logger.warning(f"mlflow.log_table failed for {artifact_file!r}: {e}")
+                logger.warning(f"mlflow log_table failed for {artifact_file!r}: {e}")
             return
 
         if self.backend != "wandb":
@@ -225,12 +229,14 @@ class Tracking:
         """
         if self.backend != "mlflow":
             return
-        import mlflow
 
         try:
-            mlflow.log_artifact(local_path, artifact_path=artifact_path)
+            # Explicit run_id via the client (not fluent `mlflow.log_artifact`): the fluent
+            # active-run stack is thread-local, so an off-main-thread caller would auto-create a
+            # phantom run. See the log_samples_to_table note above.
+            self.logger.client.log_artifact(self.logger.run_id, local_path, artifact_path=artifact_path)
         except Exception as e:  # non-fatal: artifact logging must never kill training
-            logger.warning(f"mlflow.log_artifact failed for {local_path!r}: {e}")
+            logger.warning(f"mlflow log_artifact failed for {local_path!r}: {e}")
 
     def __del__(self):
         try:
@@ -304,6 +310,10 @@ class _MlflowLoggingAdapter:
 
         mlflow.log_params(_compute_mlflow_params_from_objects(config))
         self.mlflow = mlflow
+        # Pin the owned run's id + a client so off-thread writers (see below) target THIS run
+        # explicitly rather than relying on the fluent active-run stack.
+        self.run_id = mlflow.active_run().info.run_id
+        self.client = mlflow.tracking.MlflowClient()
 
     def log(self, data, step):
         results = {k.replace("@", "_at_"): v for k, v in data.items()}
