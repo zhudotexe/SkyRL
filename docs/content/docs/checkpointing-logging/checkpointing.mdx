@@ -94,6 +94,17 @@ Checkpointing behavior is controlled by several parameters in the YAML configura
   - **Default**: `10`
   - **Purpose**: Save checkpoints every N training steps
 
+`save_on_epoch_end`
+  - **Default**: `true`
+  - **Purpose**: Also save at every epoch boundary, on top of `ckpt_interval` / `hf_save_interval`
+  - **Options**:
+
+    - `true`: Save at epoch boundaries and at the intervals
+    - `false`: Save strictly at the intervals. Worth setting on a small dataset, where an epoch is
+      only a handful of steps and the epoch-boundary saves dominate. The end-of-training save is
+      unaffected, but a resume then rewinds to the last interval checkpoint rather than to the
+      epoch boundary.
+
 `ckpt_path`
   - **Default**: `"~/ckpts/"`
   - **Purpose**: Base directory where all checkpoints are stored

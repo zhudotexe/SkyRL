@@ -1374,6 +1374,13 @@ class TrainerConfig(BaseConfig):
     """Save a full training checkpoint every N steps."""
     hf_save_interval: int = -1
     """Save HuggingFace-format model every N steps. ``-1`` to disable."""
+    save_on_epoch_end: bool = True
+    """Whether every epoch boundary also saves a checkpoint / HF export, on top of the
+    ``ckpt_interval`` and ``hf_save_interval`` cadences. ``False`` saves strictly on those
+    intervals. Small datasets are the reason to turn it off: an epoch there is only a handful of
+    steps, so the epoch-boundary saves dominate the intervals and land right next to them. The
+    end-of-training save is unaffected, but note that with this off a resume rewinds to the last
+    interval checkpoint rather than to the epoch boundary."""
     export_path: str = field(default_factory=lambda: os.path.expanduser("~/exports/"))
     """Path for exported artifacts (HF models, debug dumps, etc.).
     For sharded multi-node HF exports with ``policy.megatron_config.hf_export_config.distributed_save=True``, this must
