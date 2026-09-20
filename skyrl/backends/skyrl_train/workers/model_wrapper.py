@@ -21,6 +21,7 @@ from transformers import (
     AutoModelForImageTextToText,
     BitsAndBytesConfig,
 )
+from transformers.modeling_flash_attention_utils import prepare_fa_kwargs_from_position_ids
 
 from skyrl.backends.skyrl_train.distributed.ulysses.utils import (
     gather_outputs_and_unpad,
@@ -238,6 +239,40 @@ class HFModelWrapper(nn.Module):
             else chunked_entropy_from_logits
         )
 
+    def _packed_sequence_kwargs(self, position_ids_fwd: torch.Tensor) -> dict:
+        """Sequence-boundary kwargs for a packed (1, nnz) forward.
+
+        Flash attention recovers the boundaries of a packed row from the position ids on its own
+        (`_flash_attention_forward` case 1), so pure-attention models need nothing extra. Layers that
+        carry state along the sequence do not get that for free: transformers' GatedDeltaNet
+        (Qwen3.5/3.6, 24 of 32 layers) reads `cu_seq_lens_q` for its chunked delta rule and, through
+        Dao's `causal_conv1d_fn`, `seq_idx` for its depthwise conv. Neither is derived from position ids
+        inside the model; without them a packed row is treated as ONE sequence and recurrent state and
+        the conv window bleed across rollout boundaries, silently.
+
+        The keys are the standard `FlashAttentionKwargs` plus `seq_idx`. Every consumer filters to what
+        it accepts (`_process_flash_attention_kwargs` for FA2, the hub-kernel fallback wrapper for fla /
+        causal_conv1d), so passing them to a model without recurrent layers is a no-op that skips FA2's
+        own re-derivation of the same values. Sequence parallelism slices the packed row per rank, where
+        these would be wrong; the SP path keeps its existing behaviour.
+        """
+        if self.sequence_parallel_size > 1:
+            return {}
+        (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
+            position_ids_fwd
+        )
+        seq_lens = cu_seq_lens_q.diff()
+        seq_idx = torch.repeat_interleave(
+            torch.arange(seq_lens.numel(), dtype=torch.int32, device=seq_lens.device), seq_lens
+        ).unsqueeze(0)
+        return dict(
+            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_k=cu_seq_lens_k,
+            max_length_q=max_length_q,
+            max_length_k=max_length_k,
+            seq_idx=seq_idx,
+        )
+
     def forward(
         self,
         sequences: torch.LongTensor,
@@ -326,7 +361,12 @@ class HFModelWrapper(nn.Module):
         elif self.remove_microbatch_padding and self.attn_implementation == "flash_attention_2":
             # NOTE (sumanthrh): Don't use attention mask. position_ids is enough.
             # Not using attention mask leads to higher perf since flash attention varlen func is enabled
-            output = self.model(sequences_fwd, attention_mask=None, position_ids=position_ids_fwd)
+            output = self.model(
+                sequences_fwd,
+                attention_mask=None,
+                position_ids=position_ids_fwd,
+                **self._packed_sequence_kwargs(position_ids_fwd),
+            )
         else:
             output = self.model(sequences_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd)
 
