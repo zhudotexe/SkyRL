@@ -4,9 +4,12 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import torch
 from jaxtyping import Bool, Float, Integer
-from transformers import AutoTokenizer
 
-from skyrl.backends.skyrl_train.utils.replay_utils import make_replay_padding_indices
+from skyrl.backends.skyrl_train.utils.replay_utils import make_replay_padding_indices_np
+from skyrl.backends.skyrl_train.utils.routed_experts import (
+    RoutedExpertIndices,
+    compact_routed_expert_indices,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,13 +88,13 @@ def _reward_to_numpy(custom_reward: Union[List[float], torch.Tensor]) -> np.ndar
 
 
 def convert_prompts_responses_to_batch_tensors(
-    tokenizer: AutoTokenizer,
+    pad_token_id: int,
     prompts: List[List[int]],
     responses: List[List[int]],
     rewards: List[Union[List[float], torch.Tensor]],
     loss_masks: List[List[int]],
     logprobs: Optional[List[List[float]]] = None,
-    rollout_expert_indices: Optional[List[List[List[List[int]]]]] = None,
+    rollout_expert_indices: Optional[List[RoutedExpertIndices]] = None,
     max_seq_len: Optional[int] = None,
 ) -> Tuple[
     Float[torch.Tensor, "batch seq_len"],
@@ -115,18 +118,23 @@ def convert_prompts_responses_to_batch_tensors(
     The padded sequence length is ``max(prompt_len_i + response_len_i)``.
     This way, the max padded sequence length is ``max_seq_len``.
 
-    This makes the response-level tensors (action_mask, rewards, loss_masks, logprobs):
+    So the attention_mask is:
+    | 0       0       1       1       1       1       1 |
+    | 0       1       1       1       1       1       1 |
+    | 1       1       1       1       1       1       1 |
+
+    This makes the response-level tensors (response_mask, rewards, loss_masks, logprobs):
     | prompt prompt respon respon |
     | prompt respon respon respon |
     | respon respon respon respon |
 
-    So the action_mask is:
+    So the response_mask is:
     | 0       0       1      1    |
     | 0       1       1      1    |
     | 1       1       1      1    |
 
-    Attention mask is 1 for all real tokens, 0 for padding.
-    Action mask is 1 for the last ``response_len_i`` positions, 0 for padding.
+    attention_mask is 1 for all real tokens, 0 for padding.
+    response_mask_i is 1 for the last ``response_len_i`` positions, 0 for padding.
 
     Response-level tensors are **right-aligned** within ``(batch, max_response_len)``: non-padded
     values occupy the last ``response_len_i`` positions, with leading zeros. This matches the model
@@ -136,7 +144,7 @@ def convert_prompts_responses_to_batch_tensors(
     Assumes that the responses already contain an eos token at index -1.
 
     Args:
-        tokenizer: Model tokenizer
+        pad_token_id: Token id used to left-pad ``sequences``
         prompts: List of tokenized prompts
         responses: List of tokenized responses
         rewards: List of rewards for each response (lists or 1D tensors)
@@ -148,7 +156,7 @@ def convert_prompts_responses_to_batch_tensors(
     Returns:
         sequences: ``(batch, max_total)`` where ``max_total = max(prompt_i + response_i)``.
         attention_mask: ``(batch, max_total)``
-        action_mask: ``(batch, max_response)`` — right-aligned response indicator.
+        response_mask: ``(batch, max_response)`` — right-aligned response indicator.
         rewards: ``(batch, max_response)`` — right-aligned.
         loss_masks: ``(batch, max_response)`` — right-aligned.
         logprobs: ``(batch, max_response)`` — right-aligned, or ``None``.
@@ -168,7 +176,6 @@ def convert_prompts_responses_to_batch_tensors(
             "No truncation is performed; consider checking generator settings."
         )
 
-    pad_token_id = tokenizer.pad_token_id
     num_samples = len(prompts)
 
     # Fill NumPy buffers by slice, then convert once.
@@ -192,11 +199,11 @@ def convert_prompts_responses_to_batch_tensors(
     # Response tokens occupy the trailing response_len positions.
     col_resp = np.arange(max_response, dtype=np.int64)
     resp_pad = max_response - response_lens
-    action_mask_np = (col_resp[None, :] >= resp_pad[:, None]).astype(np.int64)
+    response_mask_np = (col_resp[None, :] >= resp_pad[:, None]).astype(np.int64)
 
     sequences = torch.from_numpy(sequences_np)
     attention_mask = torch.from_numpy(attention_mask_np)
-    action_mask = torch.from_numpy(action_mask_np)
+    response_mask = torch.from_numpy(response_mask_np)
 
     # Response-level tensors are right-aligned to match the model output.
     ret_loss_masks_np = np.zeros((num_samples, max_response), dtype=np.float32)
@@ -223,44 +230,52 @@ def convert_prompts_responses_to_batch_tensors(
     rollout_expert_indices_tensor = None
     if rollout_expert_indices is not None:
         num_samples = len(prompts)
-        if len(rollout_expert_indices) != num_samples or any(not indices for indices in rollout_expert_indices):
+        if not isinstance(rollout_expert_indices, list):
+            raise TypeError("rollout_expert_indices must be a list of NumPy arrays")
+        if len(rollout_expert_indices) != num_samples:
             raise ValueError("rollout_expert_indices must contain routes for every trajectory")
 
-        num_layers = len(rollout_expert_indices[0][0])
-        topk = len(rollout_expert_indices[0][0][0]) if num_layers > 0 else 0
+        canonical_indices = []
+        for sample_index, sample_indices in enumerate(rollout_expert_indices):
+            if not isinstance(sample_indices, np.ndarray):
+                raise TypeError(
+                    f"rollout_expert_indices entries must be NumPy arrays, got {type(sample_indices).__name__} "
+                    f"at sample {sample_index}"
+                )
+            canonical_indices.append(compact_routed_expert_indices(sample_indices))
+
+        first_shape = canonical_indices[0].shape
+        if len(first_shape) != 3 or first_shape[0] == 0:
+            raise ValueError("rollout_expert_indices must contain routes for every trajectory")
+        num_layers, topk = first_shape[1:]
         if topk < 1:
             raise ValueError("rollout_expert_indices must contain at least one expert per layer")
 
-        padded = make_replay_padding_indices(
+        batch_dtype = max((indices.dtype for indices in canonical_indices), key=lambda dtype: dtype.itemsize)
+        padded = make_replay_padding_indices_np(
             (num_samples, max_total, num_layers, topk),
-            dtype=torch.int32,
+            dtype=batch_dtype,
         )
-        for sample_index, sample_indices in enumerate(rollout_expert_indices):
-            sample_indices_tensor = torch.as_tensor(sample_indices, dtype=torch.int32)
-            if sample_indices_tensor.ndim != 3 or sample_indices_tensor.shape[1:] != (num_layers, topk):
+        for sample_index, sample_indices in enumerate(canonical_indices):
+            if sample_indices.ndim != 3 or sample_indices.shape[1:] != (num_layers, topk):
                 raise ValueError(
                     "rollout_expert_indices entries must share [layers, topk], "
-                    f"got shape {tuple(sample_indices_tensor.shape)} at sample {sample_index}"
+                    f"got shape {sample_indices.shape} at sample {sample_index}"
                 )
             left_pad = max_total - (prompt_token_lens[sample_index] + response_token_lens[sample_index])
             available = max_total - left_pad
-            if len(sample_indices) > available:
+            if sample_indices.shape[0] == 0 or sample_indices.shape[0] > available:
                 raise ValueError(
-                    f"Trajectory {sample_index} has {len(sample_indices)} route rows for {available} tokens"
+                    f"Trajectory {sample_index} has {sample_indices.shape[0]} route rows for {available} tokens"
                 )
-            padded[sample_index, left_pad : left_pad + len(sample_indices)] = sample_indices_tensor
-        rollout_expert_indices_tensor = padded
-
-        max_expert_id = int(rollout_expert_indices_tensor.max().item())
-        if max_expert_id < 2**8:
-            rollout_expert_indices_tensor = rollout_expert_indices_tensor.to(torch.uint8)
-        elif max_expert_id < 2**15:
-            rollout_expert_indices_tensor = rollout_expert_indices_tensor.to(torch.int16)
+            route_end = left_pad + sample_indices.shape[0]
+            padded[sample_index, left_pad:route_end] = sample_indices
+        rollout_expert_indices_tensor = torch.from_numpy(padded)
 
     return (
         sequences,
         attention_mask,
-        action_mask,
+        response_mask,
         ret_rewards,
         ret_loss_masks,
         logprobs_tensor,

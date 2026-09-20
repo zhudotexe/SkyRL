@@ -159,7 +159,7 @@ class BaseBatchIterator:
             advantages=batch.get("advantages"),
             attention_mask=batch.get("attention_mask"),
             loss_mask=batch.get("loss_mask"),
-            action_mask=batch.get("response_mask"),
+            response_mask=batch.get("response_mask"),
             num_actions=batch.metadata["response_length"],  # int
             rollout_logprobs=batch.get("rollout_logprobs"),
             rollout_expert_indices=batch.get("rollout_expert_indices"),
@@ -423,6 +423,18 @@ class TokenBasedBatchIterator(BaseBatchIterator):
         reordered_batch = type(ref_microbatch)(reordered_data)
         reordered_batch.metadata = ref_microbatch.metadata
         return reordered_batch
+
+    def reorder_and_combine_items(self, batches: List[List[dict]]) -> List[dict]:
+        """Restore per-sample microbatch outputs to input order."""
+        ordered = [None] * self.data.batch_size
+        for original_indices, items in zip(self._microbatches, batches):
+            if len(items) < len(original_indices):
+                raise ValueError("Microbatch output has fewer items than input samples")
+            for original_idx, item in zip(original_indices, items):
+                ordered[original_idx] = item
+        if any(item is None for item in ordered):
+            raise ValueError("Microbatch outputs do not cover every input sample")
+        return ordered
 
 
 def get_microbatch_iterator(
