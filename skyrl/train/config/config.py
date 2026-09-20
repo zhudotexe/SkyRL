@@ -340,7 +340,7 @@ class TorchProfilerConfig(BaseConfig):
 
         if is_cloud_path(self.save_path):
             raise ValueError(
-                f"`torch_profiler_config.save_path` must be a local path; got cloud URI "
+                "`torch_profiler_config.save_path` must be a local path; got cloud URI "
                 f"{self.save_path!r}. torch.profiler cannot write to cloud storage."
             )
         # Empty activities record nothing.
@@ -1018,6 +1018,14 @@ class SamplingParams(BaseConfig):
     """Optional list of stop strings for generation."""
     additional_kwargs: Optional[Dict[str, Any]] = None
     """Extra sampling kwargs passed through to the inference engine."""
+    reasoning_effort: Optional[str] = None
+    """Reasoning-effort level for models whose chat template reads one (Qwen3.8: ``xhigh`` (its default),
+    ``medium``, ``low``). Sent as the OpenAI-standard top-level request field, which vLLM merges into the
+    chat-template kwargs; the level is a system-prompt instruction, not a server-side token budget, and a
+    template that does not declare the variable ignores it. ``"none"`` additionally turns thinking off,
+    since vLLM derives ``enable_thinking = effort != "none"`` unless the caller sets it explicitly.
+    Consumed only by the ReDel surrogate path (like ``repetition_penalty``, the typed generation path's
+    allowlist drops it)."""
 
 
 @dataclass
@@ -1513,7 +1521,8 @@ class TrainerConfig(BaseConfig):
 
         if self.log_example_interval > 0:
             print(
-                f"log_example_interval has been renamed, use print_example_interval instead. Setting print_example_interval to {self.log_example_interval}"
+                "log_example_interval has been renamed, use print_example_interval instead. Setting"
+                f" print_example_interval to {self.log_example_interval}"
             )
             self.print_example_interval = self.log_example_interval
 
@@ -1563,8 +1572,7 @@ class TrainerConfig(BaseConfig):
             or self.vocab_entropy_chunk_memory_mb <= 0
         ):
             raise ValueError(
-                "vocab_entropy_chunk_memory_mb must be a positive integer, "
-                f"got {self.vocab_entropy_chunk_memory_mb!r}."
+                f"vocab_entropy_chunk_memory_mb must be a positive integer, got {self.vocab_entropy_chunk_memory_mb!r}."
             )
 
 
