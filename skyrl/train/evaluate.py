@@ -469,10 +469,10 @@ async def evaluate_step_wise(
             # pulling the export dir off the cluster. One step-scoped artifact dir per
             # eval; zero-padded so the artifact browser sorts chronologically.
             if subagent_dump_path is not None and tracker is not None:
-                step_tag = "eval_only" if global_step is None else f"global_step_{global_step:07d}"
-                tracker.log_artifact(
-                    str(subagent_dump_path), artifact_path=f"subagent_trajectories/{step_tag}"
+                step_tag = (
+                    "eval_only" if global_step is None else f"global_step_{global_step + tracker.step_offset:07d}"
                 )
+                tracker.log_artifact(str(subagent_dump_path), artifact_path=f"subagent_trajectories/{step_tag}")
 
     eval_metrics["timing/eval_generate"] = eval_generate_time
     return eval_metrics

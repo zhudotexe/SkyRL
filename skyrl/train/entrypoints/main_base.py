@@ -191,6 +191,7 @@ class BasePPOExp:
             backend=self.cfg.trainer.logger,
             config=self.cfg,
             tags=self.cfg.trainer.tags,
+            step_offset=self.cfg.trainer.log_step_offset,
         )
 
     def get_trajectory_logger(self) -> TrajectoryLogger:

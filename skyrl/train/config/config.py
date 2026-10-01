@@ -1532,6 +1532,11 @@ class TrainerConfig(BaseConfig):
     logger: str = "wandb"
     """Logger to use: ``"wandb"``, ``"mlflow"``, ``"swanlab"``, ``"tensorboard"``, or ``"console"``.
     See https://docs.skyrl.ai/docs/checkpointing-logging/logging"""
+    log_step_offset: int = 0
+    """Added to the global step in everything the tracker logs: metrics, sample tables and step-keyed eval artifacts.
+    Set it to N on a run initialized from another run's step-N export (``trainer.policy.model.path=<export>/
+    global_step_N/policy``), so its curves share the source run's step axis and its step-0 eval lands at N.
+    Checkpoint, export and dump directories on disk keep the trainer's own step."""
     enable_ray_gpu_monitor: bool = True
     """Enable background Ray GPU/RAM metrics collection and logging to wandb."""
     tags: Optional[List[str]] = None

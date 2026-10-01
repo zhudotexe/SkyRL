@@ -40,9 +40,12 @@ class Tracking:
         backend: str = "console",
         config: Optional[Union[SkyRLTrainConfig, DictConfig]] = None,
         tags: Optional[List[str]] = None,
+        step_offset: int = 0,
     ):
         assert backend in self.supported_backends, f"{backend} is not supported"
         self.backend = backend
+        # added to every step this tracker logs (trainer.log_step_offset)
+        self.step_offset = step_offset
 
         if backend == "wandb":
             import wandb
@@ -77,6 +80,7 @@ class Tracking:
         self._exception_logged = False
 
     def log(self, data, step, commit=False):
+        step += self.step_offset
         if self.backend == "wandb":
             self.logger.log(data=data, step=step, commit=commit)
         else:
@@ -113,6 +117,7 @@ class Tracking:
         if self._exception_logged:
             return
         self._exception_logged = True
+        step += self.step_offset
         tb_str = traceback.format_exc()[-10000:]
         logger.error(f"Training failed at step {step} with {type(e).__name__}:\n{tb_str}")
         if self.backend == "wandb":
@@ -171,6 +176,7 @@ class Tracking:
         listing is needed). Step ordering still holds because the zero-padded
         step sorts ahead of the suffix.
         """
+        step += self.step_offset
         if self.backend == "mlflow":
             # mlflow.log_table wants a columnar dict {col: [values...]}. `samples`
             # is a list of row tuples aligned to `columns`; transpose them. Each

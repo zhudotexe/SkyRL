@@ -191,11 +191,12 @@ class TrajectoryLogger:
             columns = [c for c in columns if c != "idx"]
             samples = [sample[1:] for sample in samples]
         # Prepend `step` to each row so rows from different calls remain
-        # distinguishable in the accumulating table.
+        # distinguishable in the accumulating table. Rows carry the step as the
+        # tracker logs it (log_samples_to_table adds the offset to `step` itself).
         tracker.log_samples_to_table(
             key=wandb_key,
             columns=columns,
-            samples=[(step, *sample) for sample in samples],
+            samples=[(step + tracker.step_offset, *sample) for sample in samples],
             step=step,
         )
 

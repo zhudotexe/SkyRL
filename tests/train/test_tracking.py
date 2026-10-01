@@ -78,3 +78,19 @@ def test_wandb_init_tags_default_none():
 
         wandb_mock.init.assert_called_once()
         assert wandb_mock.init.call_args.kwargs["tags"] is None
+
+
+def test_step_offset_shifts_metrics_and_tables():
+    """A tracker built with step_offset (trainer.log_step_offset) logs metrics and sample tables at step + offset,
+    so a run initialized from another run's step-N export plots on the source run's step axis."""
+    mlflow = MagicMock()
+    mlflow.active_run.return_value = SimpleNamespace(info=SimpleNamespace(run_id="run123"))
+    with patch.dict("sys.modules", {"mlflow": mlflow}), patch("time.time", return_value=1735689600.0):
+        tracker = Tracking(
+            project_name="proj", experiment_name="exp", backend="mlflow", config={"lr": 0.1}, step_offset=100
+        )
+        tracker.log({"eval/reward": 0.3}, step=0)
+        tracker.log_samples_to_table(key="trajectories_eval", columns=["step", "reward"], samples=[(110, 1.0)], step=10)
+    assert mlflow.log_metrics.call_args.kwargs["step"] == 100
+    log_table = mlflow.tracking.MlflowClient.return_value.log_table  # the table goes through the run-pinned client
+    assert log_table.call_args.kwargs["artifact_file"] == "trajectories_eval_step_0000110_1735689600.json"
