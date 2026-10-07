@@ -1308,6 +1308,11 @@ class GeneratorConfig(BaseConfig):
     """Max generator input length.
     For single-turn generation this can equal ``trainer.max_prompt_length`` (the initial prompt length); for multi-turn
     it is the maximum input length used for the conversation at each turn. Defaults to ``trainer.max_prompt_length``."""
+    max_input_length_eval: Optional[int] = None
+    """``max_input_length`` for evaluation rollouts only, e.g. to train at a 32K context and evaluate at 256K.
+    Defaults to ``max_input_length``. vLLM rejects a prompt longer than ``max_model_len`` minus the per-turn generation
+    budget, so this must be at most ``max_model_len - sampling_params.max_generate_length``. Read by the ReDel
+    generator; ``SkyRLGymGenerator`` uses ``max_input_length`` for both phases."""
     chat_template: ChatTemplateConfig = field(default_factory=ChatTemplateConfig)
     """Custom chat template configuration, if needed."""
     chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -1818,6 +1823,8 @@ class SkyRLTrainConfig(BaseConfig):
         # generator.max_input_length defaults to trainer.max_prompt_length
         if self.generator.max_input_length is None:
             self.generator.max_input_length = self.trainer.max_prompt_length
+        if self.generator.max_input_length_eval is None:
+            self.generator.max_input_length_eval = self.generator.max_input_length
 
         # Copy temperature from generator sampling params to algorithm config
         # so workers can access it without needing the generator config
