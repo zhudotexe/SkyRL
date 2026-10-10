@@ -483,8 +483,10 @@ class TrainingInput(TypedDict, total=False):
     kl: Float[torch.Tensor, "batch_size response_len"]  # per-token KL, current vs reference policy
     rewards: Optional[Float[torch.Tensor, "batch_size response_len"]]  # env reward, typically only on the last token
     rollout_logprobs: Optional[Float[torch.Tensor, "batch_size response_len"]]  # sampling policy; off-policy corr.
-    rollout_expert_indices: Optional[Integer[torch.Tensor, "batch_size seq_len layer_num topk"]]  # MoE router replay
-    router_padding_mask: Optional[Bool[torch.Tensor, "batch_size seq_len"]]  # True = no captured route (skip in replay)
+    # MoE router replay: dense and padded like `sequences` on Megatron; on FSDP a TensorList of `batch_size`
+    # [captured_i, layer_num, topk] tensors, the routes of each row's first captured_i real tokens
+    rollout_expert_indices: Optional[Integer[torch.Tensor, "batch_size seq_len layer_num topk"] | TensorList]
+    router_padding_mask: Optional[Bool[torch.Tensor, "batch_size seq_len"]]  # True = no captured route; Megatron only
     pixel_values: Optional[TensorList]  # list of `batch_size` [num_patches_i, dim] tensors
     image_grid_thw: Optional[TensorList]  # list of `batch_size` [num_images_i, 3] tensors
 

@@ -591,6 +591,43 @@ def test_hf_overrides_rope_parameters_must_match_megatron_trainer_side_override(
         )
 
 
+def _r3_cfg(strategy: str) -> SkyRLTrainConfig:
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.strategy = strategy
+    cfg.generator.inference_engine.enable_return_routed_experts = True
+    cfg.generator.inference_engine.distributed_executor_backend = "mp"
+    return cfg
+
+
+def test_r3_on_fsdp_passes():
+    validate_inference_engine_cfg(_r3_cfg("fsdp"))
+
+
+def test_r3_on_fsdp_rejects_sequence_parallelism():
+    cfg = _r3_cfg("fsdp")
+    cfg.trainer.policy.sequence_parallel_size = 2
+
+    with pytest.raises(AssertionError, match="sequence_parallel_size=1"):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_r3_requires_the_mp_executor_backend():
+    cfg = _r3_cfg("fsdp")
+    cfg.generator.inference_engine.distributed_executor_backend = "ray"
+
+    with pytest.raises(AssertionError, match="mp backend"):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_r3_on_megatron_requires_moe_enable_routing_replay():
+    cfg = _r3_cfg("megatron")
+
+    with pytest.raises(AssertionError, match="moe_enable_routing_replay"):
+        validate_inference_engine_cfg(cfg)
+    cfg.trainer.policy.megatron_config.moe_enable_routing_replay = True
+    validate_inference_engine_cfg(cfg)
+
+
 def test_run_engines_locally_false_requires_external_endpoint():
     cfg = SkyRLTrainConfig()
     cfg.generator.inference_engine.run_engines_locally = False

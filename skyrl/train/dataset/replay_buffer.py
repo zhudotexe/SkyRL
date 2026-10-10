@@ -67,7 +67,8 @@ class Experience:
     loss_mask: Optional[Integer[torch.LongTensor, "batch response_len"]]
     response_mask: Optional[Integer[torch.Tensor, "batch response_len"]]
     rollout_logprobs: Optional[Float[torch.Tensor, "batch response_len"]]
-    rollout_expert_indices: Optional[Integer[torch.Tensor, "batch seq_len layer_num topk"]]
+    # dense and padded like `sequences` on Megatron; one [captured_i, layer_num, topk] tensor per row on FSDP
+    rollout_expert_indices: Optional[Union[Integer[torch.Tensor, "batch seq_len layer_num topk"], TensorList]]
     num_actions: int
     info: Optional[dict]
     router_padding_mask: Optional[Bool[torch.Tensor, "batch seq_len"]] = None
@@ -101,7 +102,7 @@ class Experience:
         if self.rollout_logprobs is not None:
             self.rollout_logprobs = to(self.rollout_logprobs, device)
         if self.rollout_expert_indices is not None:
-            self.rollout_expert_indices = to(self.rollout_expert_indices, device)
+            self.rollout_expert_indices = self.rollout_expert_indices.to(device)
         if self.router_padding_mask is not None:
             self.router_padding_mask = to(self.router_padding_mask, device)
         if self.pixel_values is not None:

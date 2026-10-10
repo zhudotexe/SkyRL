@@ -28,6 +28,7 @@ from skyrl.backends.skyrl_train.distributed.ulysses.utils import (
     ulysses_pad_and_slice_inputs,
 )
 from skyrl.backends.skyrl_train.training_batch import TensorList
+from skyrl.backends.skyrl_train.utils.hf_router_replay import RouterReplay, token_routes
 from skyrl.backends.skyrl_train.utils.torch_utils import (
     chunked_entropy_from_logits,
     logprobs_from_logits,
@@ -229,6 +230,9 @@ class HFModelWrapper(nn.Module):
         else:
             self.model = pretrain_or_model
 
+        # rollout routing replay (R3): routes passed to `forward` replace the MoE routers' top-k. Inert on dense models.
+        self.router_replay = RouterReplay(self.model)
+
         self.logprobs_chunk_size = logprobs_chunk_size
 
         # TODO (sumanthrh): do the same for `logprobs_from_logits` and test.
@@ -285,8 +289,14 @@ class HFModelWrapper(nn.Module):
         pixel_values: Optional[TensorList] = None,
         image_grid_thw: Optional[TensorList] = None,
         mm_token_type_ids: Optional[torch.Tensor] = None,
+        rollout_expert_indices: Optional[TensorList] = None,
     ) -> torch.Tensor:
-        """Returns action log probs"""
+        """Returns action log probs.
+
+        ``rollout_expert_indices`` holds, per row, the experts the rollout engine routed the row's captured tokens to
+        (``(captured_i, layers, topk)``, see ``token_routes``); when given, every MoE router replays them instead of
+        its top-k.
+        """
         has_image_inputs = pixel_values is not None or image_grid_thw is not None
         if self.is_vlm:
             # VLMs use model specific 3D positional IDs, meaning sequence packing can not be supported.
@@ -322,6 +332,12 @@ class HFModelWrapper(nn.Module):
                 # (nnz, 1) -> (1, nnz)
                 position_ids_fwd = position_ids_fwd.transpose(0, 1)
                 attention_mask_fwd = None  # no attention mask with FA 2
+
+        # set on every call, so a forward without routes never replays a previous call's
+        routes = None
+        if rollout_expert_indices is not None:
+            routes = token_routes(rollout_expert_indices, attention_mask, packed=self.remove_microbatch_padding)
+        self.router_replay.set(routes)
 
         sequences_rolled = torch.roll(sequences_fwd, shifts=-1, dims=1)
         if self.sequence_parallel_size > 1:
@@ -369,6 +385,7 @@ class HFModelWrapper(nn.Module):
             )
         else:
             output = self.model(sequences_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd)
+        self.router_replay.check_replayed()
 
         logits_BSV = output["logits"]
         logits_BSV.div_(temperature)

@@ -480,7 +480,8 @@ class MegatronConfig(BaseConfig):
     moe_router_enable_expert_bias: Optional[bool] = None
     moe_enable_routing_replay: bool = False
     """Enable Megatron router replay.
-    Used together with ``generator.inference_engine.enable_return_routed_experts`` to enable R3."""
+    Used together with ``generator.inference_engine.enable_return_routed_experts`` to enable R3 on Megatron; the
+    FSDP backend replays without it."""
     moe_per_layer_logging: bool = False
     """Enable per-layer logging of MoE metrics (i.e. per layer aux losses)."""
     moe_router_dtype: str = "fp32"
@@ -1208,7 +1209,9 @@ class InferenceEngineConfig(BaseConfig):
     to change it."""
     enable_return_routed_experts: bool = False
     """Return per-layer expert routing indices, for rollout router replay (R3) when training an MoE model.
-    Used together with ``trainer.policy.megatron_config.moe_enable_routing_replay``."""
+    Requires ``distributed_executor_backend="mp"``. On Megatron, use together with
+    ``trainer.policy.megatron_config.moe_enable_routing_replay``. On FSDP, the policy's Qwen3-MoE routers replay
+    the indices (``HFModelWrapper``), which requires ``trainer.policy.sequence_parallel_size=1``."""
     max_num_batched_tokens: int = 8192
     """vLLM continuous-batching parameter: maximum number of tokens to pack into a batch."""
     enforce_eager: bool = False
