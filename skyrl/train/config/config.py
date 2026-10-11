@@ -243,6 +243,9 @@ class FSDPConfig(BaseConfig):
     mixed_precision: Optional[MixedPrecisionConfig] = None
     # specify wrap policy as a dict with `transformer_layer_cls_to_wrap` key for custom module based wrapping
     wrap_policy: dict = field(default_factory=dict)
+    moe_enable_routing_replay: bool = False
+    """Policy only. Replay the rollout engine's routes in the Qwen3-MoE routers (R3, ``HFModelWrapper``). Used together
+    with ``generator.inference_engine.enable_return_routed_experts``."""
 
 
 # ---------------------------------------------------------------------------
@@ -480,8 +483,7 @@ class MegatronConfig(BaseConfig):
     moe_router_enable_expert_bias: Optional[bool] = None
     moe_enable_routing_replay: bool = False
     """Enable Megatron router replay.
-    Used together with ``generator.inference_engine.enable_return_routed_experts`` to enable R3 on Megatron; the
-    FSDP backend replays without it."""
+    Used together with ``generator.inference_engine.enable_return_routed_experts`` to enable R3."""
     moe_per_layer_logging: bool = False
     """Enable per-layer logging of MoE metrics (i.e. per layer aux losses)."""
     moe_router_dtype: str = "fp32"
@@ -1210,8 +1212,8 @@ class InferenceEngineConfig(BaseConfig):
     enable_return_routed_experts: bool = False
     """Return per-layer expert routing indices, for rollout router replay (R3) when training an MoE model.
     Requires ``distributed_executor_backend="mp"``. On Megatron, use together with
-    ``trainer.policy.megatron_config.moe_enable_routing_replay``. On FSDP, the policy's Qwen3-MoE routers replay
-    the indices (``HFModelWrapper``), which requires ``trainer.policy.sequence_parallel_size=1``."""
+    ``trainer.policy.megatron_config.moe_enable_routing_replay``; on FSDP, with
+    ``trainer.policy.fsdp_config.moe_enable_routing_replay`` and ``trainer.policy.sequence_parallel_size=1``."""
     max_num_batched_tokens: int = 8192
     """vLLM continuous-batching parameter: maximum number of tokens to pack into a batch."""
     enforce_eager: bool = False

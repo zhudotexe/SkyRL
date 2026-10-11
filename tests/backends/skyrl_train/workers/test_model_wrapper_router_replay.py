@@ -19,6 +19,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeTopKRouter
 
 from skyrl.backends.skyrl_train.training_batch import TensorList
 
+REPLAY_MODULE = "skyrl.backends.skyrl_train.utils.hf_router_replay"
 NUM_LAYERS = 2
 NUM_EXPERTS = 8
 TOPK = 2
@@ -124,7 +125,7 @@ def test_own_routes_reproduce_topk_logprobs(HFModelWrapper, batch, packed):
     """Every logprob comes from a position with a captured route (the last token's output predicts no token), so
     replaying the rows' own routes reproduces the top-k forward exactly, but only if each route lands on its token."""
     sequences, attention_mask = batch
-    wrapper = HFModelWrapper(tiny_moe())
+    wrapper = HFModelWrapper(tiny_moe(), enable_router_replay=True)
     reference = logprobs(wrapper, sequences, attention_mask)
     routes = own_routes(wrapper, sequences, attention_mask)
     # the packed forward runs on SDPA here; production requires flash attention for it
@@ -136,7 +137,7 @@ def test_own_routes_reproduce_topk_logprobs(HFModelWrapper, batch, packed):
 def test_each_row_replays_its_own_routes(HFModelWrapper, batch, packed):
     """Changing only row 1's routes changes only row 1's logprobs."""
     sequences, attention_mask = batch
-    wrapper = HFModelWrapper(tiny_moe())
+    wrapper = HFModelWrapper(tiny_moe(), enable_router_replay=True)
     reference = logprobs(wrapper, sequences, attention_mask)
     routes = own_routes(wrapper, sequences, attention_mask)
     routes = TensorList([routes[0], other_routes(routes[1])])
@@ -148,7 +149,7 @@ def test_each_row_replays_its_own_routes(HFModelWrapper, batch, packed):
 
 def test_forward_without_routes_clears_the_previous_routes(HFModelWrapper, batch):
     sequences, attention_mask = batch
-    wrapper = HFModelWrapper(tiny_moe())
+    wrapper = HFModelWrapper(tiny_moe(), enable_router_replay=True)
     reference = logprobs(wrapper, sequences, attention_mask)
     routes = own_routes(wrapper, sequences, attention_mask)
     logprobs(wrapper, sequences, attention_mask, TensorList([other_routes(r) for r in routes.tensors]))
@@ -173,7 +174,7 @@ def test_checkpointed_grads_match_plain_grads_under_replay(HFModelWrapper, batch
     """The routes the wrapper sets stay installed until backward, so the checkpoint recompute replays them too (the
     routes differ from the top-k, so a recompute that re-routed would change the gradients)."""
     sequences, attention_mask = batch
-    wrapper = HFModelWrapper(tiny_moe())
+    wrapper = HFModelWrapper(tiny_moe(), enable_router_replay=True)
     routes = TensorList([other_routes(r) for r in own_routes(wrapper, sequences, attention_mask).tensors])
     wrapper.remove_microbatch_padding = packed
     plain = _grads(wrapper, sequences, attention_mask, routes, checkpointing=False)
@@ -186,7 +187,7 @@ def test_checkpointed_grads_match_plain_grads_under_replay(HFModelWrapper, batch
 def test_a_router_the_moe_block_bypasses_fails_loudly(HFModelWrapper, batch):
     """A MoE block that routes without the patched router (as a fused kernel might) would ignore the routes."""
     sequences, attention_mask = batch
-    wrapper = HFModelWrapper(tiny_moe())
+    wrapper = HFModelWrapper(tiny_moe(), enable_router_replay=True)
     routes = own_routes(wrapper, sequences, attention_mask)
     gate = wrapper.model.model.layers[1].mlp.gate
     gate.forward = lambda hidden_states: Qwen3MoeTopKRouter.forward(gate, hidden_states)
@@ -196,8 +197,31 @@ def test_a_router_the_moe_block_bypasses_fails_loudly(HFModelWrapper, batch):
 
 def test_more_routes_than_row_tokens_raise(HFModelWrapper, batch):
     sequences, attention_mask = batch
-    wrapper = HFModelWrapper(tiny_moe())
+    wrapper = HFModelWrapper(tiny_moe(), enable_router_replay=True)
     routes = own_routes(wrapper, sequences, attention_mask)
     routes = TensorList([torch.cat([routes[0], routes[0][:2]]), routes[1]])  # row 0 has 7 tokens
     with pytest.raises(ValueError, match="8 rollout routes for a row of 7 tokens"):
         logprobs(wrapper, sequences, attention_mask, routes)
+
+
+def test_replay_is_off_unless_enabled(HFModelWrapper, batch):
+    """Without enable_router_replay the routers keep their own forward, and routes are refused rather than ignored."""
+    sequences, attention_mask = batch
+    wrapper = HFModelWrapper(tiny_moe())
+    assert wrapper.router_replay is None
+    assert not any("forward" in vars(m) for m in wrapper.model.modules() if isinstance(m, Qwen3MoeTopKRouter))
+    routes = own_routes(wrapper, sequences, attention_mask)
+    with pytest.raises(AssertionError, match="enable_router_replay"):
+        logprobs(wrapper, sequences, attention_mask, routes)
+
+
+def test_wrapper_loads_the_router_patch_only_when_enabled(HFModelWrapper, monkeypatch, batch):
+    """Importing the wrapper, building it without replay and running a forward never import the Qwen3-MoE router
+    patch, so a transformers change to that router cannot reach models that don't replay."""
+    monkeypatch.delitem(sys.modules, REPLAY_MODULE, raising=False)
+    wrapper_module = importlib.reload(sys.modules[HFModelWrapper.__module__])
+    assert REPLAY_MODULE not in sys.modules
+    logprobs(wrapper_module.HFModelWrapper(tiny_moe()), *batch)
+    assert REPLAY_MODULE not in sys.modules
+    wrapper_module.HFModelWrapper(tiny_moe(), enable_router_replay=True)
+    assert REPLAY_MODULE in sys.modules

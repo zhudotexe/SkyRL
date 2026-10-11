@@ -663,6 +663,9 @@ def validate_inference_engine_cfg(cfg: SkyRLTrainConfig):
                 cfg.trainer.policy.megatron_config.moe_enable_routing_replay
             ), "moe_enable_routing_replay must be True to consume rollout expert indices"
         else:
+            assert (
+                cfg.trainer.policy.fsdp_config.moe_enable_routing_replay
+            ), "fsdp_config.moe_enable_routing_replay must be True to consume rollout expert indices"
             # FSDP replays through HFModelWrapper, which does not slice the routes for Ulysses sequence parallelism
             assert (
                 cfg.trainer.policy.sequence_parallel_size == 1

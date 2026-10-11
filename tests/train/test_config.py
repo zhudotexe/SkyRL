@@ -596,11 +596,21 @@ def _r3_cfg(strategy: str) -> SkyRLTrainConfig:
     cfg.trainer.strategy = strategy
     cfg.generator.inference_engine.enable_return_routed_experts = True
     cfg.generator.inference_engine.distributed_executor_backend = "mp"
+    if strategy == "fsdp":
+        cfg.trainer.policy.fsdp_config.moe_enable_routing_replay = True
     return cfg
 
 
 def test_r3_on_fsdp_passes():
     validate_inference_engine_cfg(_r3_cfg("fsdp"))
+
+
+def test_r3_on_fsdp_requires_moe_enable_routing_replay():
+    cfg = _r3_cfg("fsdp")
+    cfg.trainer.policy.fsdp_config.moe_enable_routing_replay = False
+
+    with pytest.raises(AssertionError, match="fsdp_config.moe_enable_routing_replay"):
+        validate_inference_engine_cfg(cfg)
 
 
 def test_r3_on_fsdp_rejects_sequence_parallelism():

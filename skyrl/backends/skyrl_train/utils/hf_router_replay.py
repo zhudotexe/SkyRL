@@ -50,6 +50,10 @@ class RouterReplay:
         self.routes = routes
         self.num_replayed = 0
 
+    def set_rows(self, routes: Optional[TensorList], attention_mask: torch.Tensor, packed: bool) -> None:
+        """``set`` one microbatch's per-row routes, laid out by ``token_routes``, or None to route by top-k."""
+        self.set(None if routes is None else token_routes(routes, attention_mask, packed))
+
     def check_replayed(self) -> None:
         """Raise unless every patched router replayed the routes in the forward since ``set``. A MoE block that routes
         without calling its router module (a fused kernel, say) would otherwise ignore the routes silently."""
