@@ -17,7 +17,7 @@ import os
 import sys
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -81,6 +81,26 @@ class GeneratedOutputGroup:
     global_step_when_scheduled: int
     group_completion_time_s: Optional[float] = None
     prompts: Optional[List[Any]] = None
+
+
+def _rekey_carried_group(group: GeneratedOutputGroup, epoch: int) -> GeneratedOutputGroup:
+    """Suffix ``@carry<epoch>`` to a group's uid and to its trajectory ids' ``instance_id``.
+
+    A carried group trains alongside the next epoch's draws, which include its prompt again. With the original
+    uid, a mini-batch holding both groups would fail ``mark_consumed_uids``'s duplicate check and pool them as one
+    GRPO / pass@n group, and once the carried group trained, the next epoch's draw of the prompt would be skipped
+    as already consumed. With the original trajectory ids, step-wise validation would reject the repeated ids in
+    the concatenated mini-batch. A group carried through several epochs gets one suffix per epoch.
+    """
+    suffix = f"@carry{epoch}"
+    generator_output = group.generator_output
+    trajectory_ids = generator_output.get("trajectory_ids")
+    if trajectory_ids is not None:
+        generator_output = {
+            **generator_output,
+            "trajectory_ids": [replace(tid, instance_id=tid.instance_id + suffix) for tid in trajectory_ids],
+        }
+    return replace(group, uid=group.uid + suffix, generator_output=generator_output)
 
 
 @dataclass
@@ -156,19 +176,22 @@ class _AsyncStalenessManager:
         self._stat.accepted = (global_step - 1) * self.mini_batch_size
         self._stat.submitted = self._stat.accepted
 
-    async def validate_state_at_epoch_end(self, global_step: int) -> None:
+    async def validate_state_at_epoch_end(self, global_step: int, num_carried: int) -> None:
         """
         Check that the current version and accepted rollouts are consistent with the global step.
 
         Args:
             global_step: The global step we are about to train on (after incrementing).
+            num_carried: Accepted groups not trained yet because the epoch ran out of prompts mid mini-batch;
+                they are carried into the next epoch's first mini-batch (``sample_full_batch``).
         """
         async with self._cond:
             assert self._stat.running == 0, "We expect no rollouts are running at end of an epoch."
             consumed = (global_step - 1) * self.mini_batch_size
-            assert (
-                self._stat.accepted == consumed
-            ), f"Unexpected number of accepted rollouts. Got {self._stat.accepted} != {consumed}."
+            assert self._stat.accepted == consumed + num_carried, (
+                f"Unexpected number of accepted rollouts. Got {self._stat.accepted} != {consumed} trained "
+                f"+ {num_carried} carried."
+            )
             assert (
                 self._current_global_step == global_step
             ), f"Unexpected current version. Got {self._current_global_step} != {global_step}."
@@ -338,6 +361,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         self.mini_batch_size = cfg.trainer.policy_mini_batch_size
         self.max_staleness_steps = cfg.trainer.fully_async.max_staleness_steps
         self.sample_full_batch = cfg.trainer.fully_async.sample_full_batch
+        # Under sample_full_batch, the kept groups of the mini-batch an epoch ran out of prompts to fill, which seed
+        # the next mini-batch, and the number of groups dropped while collecting them, which the step that trains
+        # them reports; see `train`.
+        self._carried_groups: List[GeneratedOutputGroup] = []
+        self._num_carried_dropped = 0
 
         self._phase_gauge = TrainingPhaseGauge()
 
@@ -523,9 +551,16 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
                 # Steps trained in THIS epoch (not global_step % num_steps_per_epoch: sample_full_batch can
                 # end an epoch early, drifting global_step out of epoch alignment). On resume the dataloader
-                # already reflects this epoch's trained steps. The range below is just an upper bound.
+                # already reflects this epoch's trained steps.
                 trained_steps_this_epoch = self.async_train_dataloader.num_trained() // self.mini_batch_size
-                for _step_idx in range(self.global_step, (1 + epoch) * self.num_steps_per_epoch + 1):
+                # One iteration per step left in the epoch, counted from trained steps rather than global_step:
+                # the checkpoints written at a max_training_steps stop and at a sample_full_batch epoch end are
+                # labelled with the step about to run, so a run resumed from one has global_step a step ahead of
+                # its trained steps. Under sample_full_batch the epoch instead ends at the collect that finds its
+                # prompts exhausted, which can follow a full epoch of steps (a partial mini-batch carried in from
+                # the previous epoch can cover this epoch's drops), so that collect gets one more iteration.
+                num_iterations = self.num_steps_per_epoch - trained_steps_this_epoch + int(self.sample_full_batch)
+                for _ in range(num_iterations):
                     with Timer("step", self.all_timings):
                         self._loop_gauges.set(
                             "skyrl_gen_buffer_qsize",
@@ -544,20 +579,27 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         )
 
                         if epoch_exhausted:
-                            # Exhausted mid mini-batch: discard the partial batch (marked consumed so it
-                            # isn't regenerated on resume) and end the epoch early.
-                            if cur_generation_group_mini_batch:
-                                for _ in cur_generation_group_mini_batch:
-                                    await self._staleness_manager.on_rollout_filtered()
-                                await self.async_train_dataloader.mark_filtered_uids(
-                                    [g.uid for g in cur_generation_group_mini_batch]
-                                )
-                                logger.warning(
-                                    f"sample_full_batch: epoch {epoch} exhausted with a partial mini-batch of "
-                                    f"{len(cur_generation_group_mini_batch)} group(s); discarding and ending the epoch."
-                                )
-                            # Save the end-of-epoch checkpoint the normal is_epoch_end path would have, since
-                            # we break before reaching it.
+                            # The epoch's prompts ran out (under sample_full_batch, every epoch ends here): carry
+                            # the partial, possibly empty, mini-batch into the next one, which
+                            # `_collect_generation_mini_batch` starts from. Of its dropped groups only the count is
+                            # carried, so epochs that take no step hold no generated groups beyond this partial
+                            # mini-batch. The kept groups stay accepted, holding their staleness capacity until
+                            # they train.
+                            # Resume: their uids are not marked consumed, so a resume from the end-of-epoch
+                            # checkpoint below regenerates the ones drawn in this epoch. It loses the ones carried
+                            # into this epoch (an epoch can end before the carry it started with trains): the
+                            # consumed sets of the epochs they were drawn in are already cleared, so nothing
+                            # redraws them.
+                            self._carried_groups = [
+                                _rekey_carried_group(g, epoch) for g in cur_generation_group_mini_batch
+                            ]
+                            self._num_carried_dropped += len(cur_dropped_groups)
+                            logger.info(
+                                f"sample_full_batch: epoch {epoch} exhausted with a partial mini-batch of "
+                                f"{len(self._carried_groups)} group(s); carrying it into the next epoch."
+                            )
+                            # The end-of-epoch checkpoint (the per-step is_epoch_end save is off under
+                            # sample_full_batch).
                             if self.cfg.trainer.save_on_epoch_end:
                                 if self.cfg.trainer.ckpt_interval > 0:
                                     with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
@@ -568,8 +610,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             break
 
                         if self.sample_full_batch:
-                            # The collect loop returns exactly mini_batch_size kept groups here.
-                            num_dropped = len(cur_dropped_groups)
+                            # The collect loop returns exactly mini_batch_size kept groups here. If it started from
+                            # a carried-in partial mini-batch, the groups dropped while collecting that count too.
+                            num_dropped = len(cur_dropped_groups) + self._num_carried_dropped
+                            self._num_carried_dropped = 0
                             keep_rate = self.mini_batch_size / (self.mini_batch_size + num_dropped)
                             self.all_metrics["async/num_groups_dropped"] = num_dropped
                             self.all_metrics["async/keep_rate"] = keep_rate
@@ -629,8 +673,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     self.all_metrics = {}
 
                     # 7. Checkpointing. At interval and, when save_on_epoch_end is set, at the last
-                    # step of each epoch.
-                    is_epoch_end = trained_steps_this_epoch == self.num_steps_per_epoch
+                    # step of each epoch. Under sample_full_batch the epoch ends at the exhausted collect
+                    # instead, which saves the epoch-end checkpoint itself.
+                    is_epoch_end = not self.sample_full_batch and trained_steps_this_epoch == self.num_steps_per_epoch
                     epoch_end_save = is_epoch_end and self.cfg.trainer.save_on_epoch_end
                     if self.cfg.trainer.ckpt_interval > 0:
                         if epoch_end_save or self.global_step % self.cfg.trainer.ckpt_interval == 0:
@@ -703,7 +748,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     generation_output_group_buffer.qsize() == 0
                 ), f"We expect all generation output to be consumed by the training worker at end of an epoch, got {generation_output_group_buffer.qsize()}."
                 await self.async_train_dataloader.reset_at_epoch_end()
-                await self._staleness_manager.validate_state_at_epoch_end(self.global_step)
+                await self._staleness_manager.validate_state_at_epoch_end(
+                    self.global_step, num_carried=len(self._carried_groups)
+                )
 
                 # End of an epoch.
         finally:
@@ -717,6 +764,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             # All epochs completed: advance past the last epoch so resuming from the final checkpoint
             # does not redo the last epoch (whose consumed UIDs were cleared at its epoch end).
             self.epoch = self.cfg.trainer.epochs
+            if self._carried_groups:
+                logger.warning(
+                    f"sample_full_batch: training ended with a partial mini-batch of {len(self._carried_groups)} "
+                    "group(s) carried out of the last epoch; it is not trained."
+                )
 
         # safety net: always save final checkpoint at end of training.
         if self.cfg.trainer.ckpt_interval > 0:
@@ -800,17 +852,22 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         Without ``sample_full_batch``, blocks until ``mini_batch_size`` groups are available. With it,
         drops zero-variance groups (freeing their capacity, marking UIDs consumed) and keeps pulling
         until ``mini_batch_size`` non-zero-variance groups are collected, which can exhaust the epoch.
+        Collection starts from the kept groups the previous epoch carried over (none except on an epoch's
+        first mini-batch).
 
         Returns ``(kept_groups, dropped_groups, epoch_exhausted)``. On exhaustion the kept groups are a
-        (possibly empty) partial batch to discard; dropped groups are kept for metrics only.
+        (possibly empty) partial batch for the caller to carry into the next epoch. The dropped groups are
+        the ones this call dropped, kept for metrics only.
         """
-        kept_groups: List[GeneratedOutputGroup] = []
+        kept_groups, self._carried_groups = self._carried_groups, []
         dropped_groups: List[GeneratedOutputGroup] = []
         epoch_exhausted = False
         # Buffer occupancy when this step starts waiting.
         self.all_metrics["async/gen_buffer_qsize_at_wait_start"] = generation_output_group_buffer.qsize()
         with self._phase_gauge.timed_phase("wait_for_generation_buffer", self.all_timings):
-            buffer_pbar = tqdm(total=self.mini_batch_size, initial=0, desc="Generation Buffer Progress", position=1)
+            buffer_pbar = tqdm(
+                total=self.mini_batch_size, initial=len(kept_groups), desc="Generation Buffer Progress", position=1
+            )
             while len(kept_groups) < self.mini_batch_size:
                 # We do finish-time FIFO here (not schedule-time FIFO).
                 if not self.sample_full_batch:

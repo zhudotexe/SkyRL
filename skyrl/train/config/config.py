@@ -1002,8 +1002,8 @@ class FullyAsyncConfig(BaseConfig):
     """Requires ``zero_variance_filter=True``. Drop zero-variance groups and keep pulling until the
     mini-batch is full of non-zero-variance groups (async-native DAPO ``dynamic_sampling="filter"``).
     Dropped groups are marked consumed (not regenerated on resume), so the per-epoch step count becomes
-    an upper bound: if the epoch's prompts run out mid mini-batch, the partial batch is discarded and
-    the epoch ends."""
+    an upper bound: if the epoch's prompts run out mid mini-batch, the epoch ends and the partial batch
+    is carried into the next epoch's first mini-batch (the last epoch's is not trained)."""
     clear_kv_cache_on_weight_sync: bool = False
     """Whether or not to clear the KV cache on weight sync. Defaults to False.
     If False, we reuse KV cache from stale policies during generation
