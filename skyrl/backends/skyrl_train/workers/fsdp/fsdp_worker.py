@@ -178,6 +178,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             meta_init=use_meta,
             language_model_only=self.cfg.policy.language_model_only,
             logprobs_chunk_size=self.cfg.logprobs_chunk_size,
+            enable_router_replay=self.cfg.policy.fsdp_config.moe_enable_routing_replay,
         )
         self._seq_parallel_monkey_patch(model=wrapped_model.model)
 

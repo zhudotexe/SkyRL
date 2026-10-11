@@ -1016,6 +1016,7 @@ class PolicyWorkerBase(Worker):
                 entropy_requires_grad=self.cfg.algorithm.use_entropy_loss,
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
+                rollout_expert_indices=experience.rollout_expert_indices,
             )
             # loss function
             # TODO: recompute advantages
@@ -1362,6 +1363,7 @@ class PolicyWorkerBase(Worker):
                 temperature=self.cfg.algorithm.temperature,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
+                rollout_expert_indices=micro_batch.get("rollout_expert_indices", None),
             )
         policy_logprob = policy_logprob.to("cpu")
         output = TrainingOutputBatch(

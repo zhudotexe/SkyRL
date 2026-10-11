@@ -243,6 +243,9 @@ class FSDPConfig(BaseConfig):
     mixed_precision: Optional[MixedPrecisionConfig] = None
     # specify wrap policy as a dict with `transformer_layer_cls_to_wrap` key for custom module based wrapping
     wrap_policy: dict = field(default_factory=dict)
+    moe_enable_routing_replay: bool = False
+    """Policy only. Replay the rollout engine's routes in the Qwen3-MoE routers (R3, ``HFModelWrapper``). Used together
+    with ``generator.inference_engine.enable_return_routed_experts``."""
 
 
 # ---------------------------------------------------------------------------
@@ -1208,7 +1211,9 @@ class InferenceEngineConfig(BaseConfig):
     to change it."""
     enable_return_routed_experts: bool = False
     """Return per-layer expert routing indices, for rollout router replay (R3) when training an MoE model.
-    Used together with ``trainer.policy.megatron_config.moe_enable_routing_replay``."""
+    Requires ``distributed_executor_backend="mp"``. On Megatron, use together with
+    ``trainer.policy.megatron_config.moe_enable_routing_replay``; on FSDP, with
+    ``trainer.policy.fsdp_config.moe_enable_routing_replay`` and ``trainer.policy.sequence_parallel_size=1``."""
     max_num_batched_tokens: int = 8192
     """vLLM continuous-batching parameter: maximum number of tokens to pack into a batch."""
     enforce_eager: bool = False

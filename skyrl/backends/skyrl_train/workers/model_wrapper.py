@@ -55,6 +55,8 @@ class HFModelWrapper(nn.Module):
         packing_samples (bool, optional): Whether to pack samples during training. Defaults to False.
         temperature (float, optional): Temperature for action selection. Defaults to 1.0.
         use_liger_kernel (bool, optional): Whether to use Liger Kernel for the model. Defaults to False.
+        enable_router_replay (bool, optional): Replay the rollout engine's routes in the Qwen3-MoE routers (R3).
+            Defaults to False.
     """
 
     def __init__(
@@ -80,6 +82,7 @@ class HFModelWrapper(nn.Module):
         meta_init: bool = False,
         language_model_only: bool = False,
         logprobs_chunk_size: int = 1024,
+        enable_router_replay: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -229,6 +232,14 @@ class HFModelWrapper(nn.Module):
         else:
             self.model = pretrain_or_model
 
+        # rollout routing replay (R3): routes passed to `forward` replace the MoE routers' top-k. Imported only when
+        # enabled, so a wrapper that doesn't replay never loads the Qwen3-MoE router patch.
+        self.router_replay = None
+        if enable_router_replay:
+            from skyrl.backends.skyrl_train.utils.hf_router_replay import RouterReplay
+
+            self.router_replay = RouterReplay(self.model)
+
         self.logprobs_chunk_size = logprobs_chunk_size
 
         # TODO (sumanthrh): do the same for `logprobs_from_logits` and test.
@@ -285,8 +296,14 @@ class HFModelWrapper(nn.Module):
         pixel_values: Optional[TensorList] = None,
         image_grid_thw: Optional[TensorList] = None,
         mm_token_type_ids: Optional[torch.Tensor] = None,
+        rollout_expert_indices: Optional[TensorList] = None,
     ) -> torch.Tensor:
-        """Returns action log probs"""
+        """Returns action log probs.
+
+        ``rollout_expert_indices`` holds, per row, the experts the rollout engine routed the row's captured tokens to
+        (``(captured_i, layers, topk)``, see ``token_routes``); when given, every MoE router replays them instead of
+        its top-k. Needs ``enable_router_replay``.
+        """
         has_image_inputs = pixel_values is not None or image_grid_thw is not None
         if self.is_vlm:
             # VLMs use model specific 3D positional IDs, meaning sequence packing can not be supported.
@@ -322,6 +339,12 @@ class HFModelWrapper(nn.Module):
                 # (nnz, 1) -> (1, nnz)
                 position_ids_fwd = position_ids_fwd.transpose(0, 1)
                 attention_mask_fwd = None  # no attention mask with FA 2
+
+        if self.router_replay is not None:
+            # set on every call, so a forward without routes never replays a previous call's
+            self.router_replay.set_rows(rollout_expert_indices, attention_mask, packed=self.remove_microbatch_padding)
+        else:
+            assert rollout_expert_indices is None, "rollout_expert_indices need enable_router_replay=True"
 
         sequences_rolled = torch.roll(sequences_fwd, shifts=-1, dims=1)
         if self.sequence_parallel_size > 1:
@@ -369,6 +392,8 @@ class HFModelWrapper(nn.Module):
             )
         else:
             output = self.model(sequences_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd)
+        if self.router_replay is not None:
+            self.router_replay.check_replayed()
 
         logits_BSV = output["logits"]
         logits_BSV.div_(temperature)

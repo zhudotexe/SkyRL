@@ -45,6 +45,7 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     compute_approx_kl,
     get_kl_controller,
 )
+from skyrl.backends.skyrl_train.utils.routed_experts import compact_routed_expert_indices
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
 from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
@@ -890,6 +891,10 @@ class RayPPOTrainer:
 
         logprobs: Optional[List[List[float]]] = generator_output.get("rollout_logprobs", None)
         rollout_expert_indices = generator_output.get("rollout_expert_indices", None)
+        # Megatron replays a dense route tensor padded like `sequences`. FSDP's HFModelWrapper takes one
+        # [captured_i, layers, topk] tensor per row instead, which holds only the captured tokens' routes rather than
+        # rows x the longest row (384 B per position on Qwen3-30B-A3B).
+        dense_routes = self.cfg.trainer.strategy == "megatron"
 
         pixel_values = generator_output.get("pixel_values", None)
         image_grid_thw = generator_output.get("image_grid_thw", None)
@@ -919,14 +924,18 @@ class RayPPOTrainer:
             rewards,
             loss_masks,
             logprobs,
-            rollout_expert_indices,
+            rollout_expert_indices if dense_routes else None,
             max_seq_len=self.cfg.trainer.algorithm.max_seq_len,
         )
         router_padding_mask = None
-        if rollout_expert_indices is not None:
+        if rollout_expert_indices is not None and dense_routes:
             router_padding_mask = make_router_padding_mask(
                 attention_masks_tensor,
                 [len(indices) for indices in rollout_expert_indices],
+            )
+        elif rollout_expert_indices is not None:
+            rollout_expert_indices_tensor = TensorList(
+                [torch.from_numpy(compact_routed_expert_indices(indices)) for indices in rollout_expert_indices]
             )
 
         # sanity check for off_policy_correction

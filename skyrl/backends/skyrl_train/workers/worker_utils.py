@@ -5,7 +5,11 @@ import torch
 import torch.distributed as dist
 
 from skyrl.backends.skyrl_train.distributed.strategy import DistributedStrategy
-from skyrl.backends.skyrl_train.training_batch import TensorBatch, TrainingInputBatch
+from skyrl.backends.skyrl_train.training_batch import (
+    TensorBatch,
+    TensorList,
+    TrainingInputBatch,
+)
 from skyrl.backends.skyrl_train.utils.replay_utils import make_replay_padding_indices
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.train.dataset.bin_packing import make_seq_packer
@@ -325,7 +329,10 @@ class TokenBasedBatchIterator(BaseBatchIterator):
         if self.data.get("rollout_logprobs") is not None:
             ref_tensor = self.data["rollout_logprobs"]
             data["rollout_logprobs"] = torch.zeros((batch_size, num_actions), dtype=ref_tensor.dtype, device=device)
-        if self.data.get("rollout_expert_indices") is not None:
+        if isinstance(self.data.get("rollout_expert_indices"), TensorList):
+            # no captured routes: HFModelWrapper gives the row's one real token a dummy route
+            data["rollout_expert_indices"] = TensorList([self.data["rollout_expert_indices"][0][:0]])
+        elif self.data.get("rollout_expert_indices") is not None:
             ref_tensor = self.data["rollout_expert_indices"]
             data["rollout_expert_indices"] = make_replay_padding_indices(
                 (batch_size, *ref_tensor.shape[1:]),
