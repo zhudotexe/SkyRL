@@ -29,6 +29,7 @@ from skyrl.train.generators.utils import (
 from skyrl.train.utils import Timer
 from skyrl.train.utils.trainer_utils import (
     calculate_per_dataset_metrics,
+    decode_rows,
     dump_per_dataset_eval_results,
     validate_generator_output,
 )
@@ -97,7 +98,7 @@ def _maybe_redel_dump_subagent_trajectories(
     records = concat_generator_outputs.get("redel_step_records")
     if not records:
         return None
-    response_ids = concat_generator_outputs["response_ids"]
+    responses = decode_rows(tokenizer, concat_generator_outputs["response_ids"])
     # Authoritative per-step score: matches what dump_per_dataset_eval_results writes, and
     # reflects generator post-processing (zero_reward_on_non_stop / overlong filtering) that
     # the record's raw token_rewards predate. Token-level rewards are summed to a scalar.
@@ -127,7 +128,7 @@ def _maybe_redel_dump_subagent_trajectories(
                 "step_idx": len(agent["steps"]),
                 "is_last": rec["is_last"],
                 "reward": _scalar_reward(i),
-                "response": tokenizer.decode(response_ids[i]),
+                "response": responses[i],
             }
         )
 

@@ -12,7 +12,8 @@ import torch
 from loguru import logger
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
 from skyrl.backends.skyrl_train.utils.io import io
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
@@ -321,6 +322,28 @@ def get_group_completion_metrics(
     return metrics
 
 
+BATCH_DECODE_EVAL_DUMPS = False
+"""Whether ``decode_rows`` may decode in one Rust call. Only an eval-only job's driver turns it on (redel-rl's
+``main_eval``). A trainer keeps the per-row decode: its eval dumps run on the event loop a fully-async generator
+shares, so a faster dump would change which groups land in which step."""
+
+
+def decode_rows(tokenizer: AutoTokenizer, rows: List[List[int]]) -> List[str]:
+    """``[tokenizer.decode(row) for row in rows]``. With ``BATCH_DECODE_EVAL_DUMPS`` on, it is one call to the Rust
+    tokenizer's ``decode_batch`` (which decodes the rows in parallel, outside the GIL) when that returns the same
+    strings: for a tokenizer that keeps the stock fast-tokenizer decode, which is the Rust decode of the row followed
+    by a clean-up of tokenization spaces that is off here. Otherwise the rows are decoded one by one."""
+    if (
+        BATCH_DECODE_EVAL_DUMPS
+        and isinstance(tokenizer, TokenizersBackend)
+        and type(tokenizer).decode is PreTrainedTokenizerBase.decode
+        and type(tokenizer)._decode is TokenizersBackend._decode
+        and not tokenizer.clean_up_tokenization_spaces
+    ):
+        return tokenizer.backend_tokenizer.decode_batch(rows, skip_special_tokens=False)
+    return [tokenizer.decode(row) for row in rows]
+
+
 def dump_per_dataset_eval_results(
     dump_dir_path: Path,
     tokenizer: AutoTokenizer,
@@ -333,8 +356,8 @@ def dump_per_dataset_eval_results(
     """Dump evaluation results per dataset and overall aggregated results."""
 
     # Prepare common data
-    input_prompts = [tokenizer.decode(prompt) for prompt in concat_generator_outputs["prompt_token_ids"]]
-    output_responses = [tokenizer.decode(response) for response in concat_generator_outputs["response_ids"]]
+    input_prompts = decode_rows(tokenizer, concat_generator_outputs["prompt_token_ids"])
+    output_responses = decode_rows(tokenizer, concat_generator_outputs["response_ids"])
 
     # Group indices by data source
     data_source_indices = {}
